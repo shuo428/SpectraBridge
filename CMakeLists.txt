@@ -26,6 +26,11 @@ set_target_properties(SpectraBridgeJni PROPERTIES
     OUTPUT_NAME "SpectraBridgeJni"
 )
 
+add_executable(MockFpgaServer
+    tools/mock-fpga/MockFpgaServer.cpp
+)
+
 if (WIN32)
     target_link_libraries(SpectraBridgeJni PRIVATE ws2_32)
+    target_link_libraries(MockFpgaServer PRIVATE ws2_32)
 endif()
