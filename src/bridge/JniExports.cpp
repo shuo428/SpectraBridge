@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "protocol/ImageProtocol.h"
 #include "springbootjni_jni_SpectraBridgeNative.h"
 
 namespace {
@@ -163,6 +164,9 @@ JNIEXPORT void JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeConnect(
     config.image_endpoint.host = host_value;
     config.image_endpoint.port = static_cast<uint16_t>(image_port);
     config.verify_crc = (verify_crc == JNI_TRUE);
+    config.expected_width = 800u;
+    config.expected_height = 600u;
+    config.expected_pixel_format = spectra::protocol::kPixelFormatRaw16Low12;
 
     std::string error;
     if (!context->client->Connect(config, &error))

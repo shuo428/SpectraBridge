@@ -29,6 +29,11 @@ struct SpectraBridgeConfig {
     TcpEndpoint image_endpoint;
     // CRC 校验默认开启，调试协议时如需临时关闭可以通过配置控制。
     bool verify_crc;
+    // 当前项目使用 GLUX1605BSI 的 800x600 有效区域。
+    // 将预期尺寸放入配置而不是散落在接收循环中，后续切换 ROI 时只需调整配置来源。
+    uint32_t expected_width;
+    uint32_t expected_height;
+    uint32_t expected_pixel_format;
 };
 
 // 整个 native 采集桥的核心服务类。

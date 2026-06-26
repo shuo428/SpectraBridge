@@ -1,6 +1,7 @@
 #include "image/ImageConverter.h"
 
 #include <cstddef>
+#include <sstream>
 
 #include "network/ByteUtils.h"
 #include "protocol/ImageProtocol.h"
@@ -15,16 +16,20 @@ bool ConvertRaw16Low12ToGray(const std::vector<uint8_t>& payload,
                              std::string* error)
 {
     // 一帧像素总数固定由宽高决定，后续所有缓冲区大小都基于这个值。
-    const std::size_t pixel_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
-    const std::size_t expected_payload_size = protocol::ComputeRaw16Low12PayloadSize(pixel_count);
+    std::size_t expected_payload_size = 0u;
+    if (!protocol::TryComputeRaw16Low12PayloadSize(width, height, &expected_payload_size))
+    {
+        protocol::SetImageProtocolError(
+            error, "INVALID_DIMENSIONS", "RAW16 payload size calculation overflow");
+        return false;
+    }
+    const std::size_t pixel_count = expected_payload_size / sizeof(uint16_t);
 
     // 当前协议中每个像素占 2 字节，因此 payload 长度必须严格等于 width * height * 2。
     if (payload.size() != expected_payload_size)
     {
-        if (error != NULL)
-        {
-            *error = "RAW16(low12 valid) payload size mismatch";
-        }
+        protocol::SetImageProtocolError(
+            error, "PAYLOAD_LENGTH_MISMATCH", "RAW16(low12 valid) payload size mismatch");
         return false;
     }
 
@@ -41,6 +46,20 @@ bool ConvertRaw16Low12ToGray(const std::vector<uint8_t>& payload,
     {
         const std::size_t payload_offset = pixel_index * sizeof(uint16_t);
         const uint16_t pixel16 = network::ReadUint16LE(payload.data() + payload_offset);
+
+        // 协议明确规定高 4 位是填充位且必须为 0。必须在掩码前检查；
+        // 如果先执行 & 0x0FFF，位对齐、字节序或 FPGA 打包错误会被静默隐藏。
+        if ((pixel16 & 0xF000u) != 0u)
+        {
+            const std::size_t x = pixel_index % static_cast<std::size_t>(width);
+            const std::size_t y = pixel_index / static_cast<std::size_t>(width);
+            std::ostringstream message;
+            message << "RAW16 high bits are not zero at x=" << x
+                    << ", y=" << y
+                    << ", rawValue=" << static_cast<unsigned int>(pixel16);
+            protocol::SetImageProtocolError(error, "INVALID_HIGH_BITS", message.str());
+            return false;
+        }
 
         // 只有低 12 位是真正的像素数据，高 4 位是 FPGA 侧补齐时产生的填充位。
         // 这里显式做掩码，避免上层误把高 4 位当成有效强度。

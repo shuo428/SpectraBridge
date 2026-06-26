@@ -1,6 +1,8 @@
 #include "service/SpectraBridgeClient.h"
 
 #include <array>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 
 #include "image/ImageConverter.h"
@@ -17,6 +19,18 @@ namespace {
 // 给图像 payload 设置上限，防止协议字段异常导致分配过大内存。
 const std::size_t kMaxImagePayloadBytes = 16u * 1024u * 1024u;
 
+std::string BuildIntegrityError(const std::string& code, const std::string& message)
+{
+    return "[" + code + "] " + message;
+}
+
+std::string ToHex32(uint32_t value)
+{
+    std::ostringstream stream;
+    stream << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0') << value;
+    return stream.str();
+}
+
 }  // namespace
 
 SpectraBridgeClient::SpectraBridgeClient(bridge::BridgeCallbacks* callbacks)
@@ -24,6 +38,9 @@ SpectraBridgeClient::SpectraBridgeClient(bridge::BridgeCallbacks* callbacks)
       running_(false)
 {
     config_.verify_crc = true;
+    config_.expected_width = 800u;
+    config_.expected_height = 600u;
+    config_.expected_pixel_format = protocol::kPixelFormatRaw16Low12;
 }
 
 SpectraBridgeClient::~SpectraBridgeClient()
@@ -242,7 +259,9 @@ void SpectraBridgeClient::ImageReceiveLoop()
         {
             if (running_.load())
             {
-                HandleWorkerFailure("image", error);
+                HandleWorkerFailure(
+                    "image",
+                    BuildIntegrityError("HEADER_RECEIVE_FAILED", error));
             }
             return;
         }
@@ -254,27 +273,55 @@ void SpectraBridgeClient::ImageReceiveLoop()
             return;
         }
 
+        // ParseImageFrameHeader 验证的是协议通用合法性；这里再验证本次连接所配置的
+        // 具体图像规格。尺寸不匹配时不能把图像交给上层，否则后续显示和定量分析都会错位。
+        if (header.width != config_.expected_width || header.height != config_.expected_height)
+        {
+            HandleWorkerFailure(
+                "image",
+                BuildIntegrityError(
+                    "INVALID_DIMENSIONS",
+                    "received dimensions do not match configured dimensions"));
+            return;
+        }
+
+        if (header.pixel_format != config_.expected_pixel_format)
+        {
+            HandleWorkerFailure(
+                "image",
+                BuildIntegrityError(
+                    "INVALID_PIXEL_FORMAT",
+                    "received pixel format does not match configured pixel format"));
+            return;
+        }
+
         if (header.header_len > protocol::kImageFrameHeaderSize)
         {
             // 如果协议以后扩展头部字段，当前版本直接跳过扩展区，保持前向兼容。
             std::vector<uint8_t> extended_header(header.header_len - protocol::kImageFrameHeaderSize);
             if (!image_client_.RecvAll(extended_header.data(), extended_header.size(), &error))
             {
-                HandleWorkerFailure("image", error);
+                HandleWorkerFailure(
+                    "image",
+                    BuildIntegrityError("HEADER_RECEIVE_FAILED", error));
                 return;
             }
         }
 
         if (header.payload_len == 0u || header.payload_len > kMaxImagePayloadBytes)
         {
-            HandleWorkerFailure("image", "payload_len is outside allowed range");
+            HandleWorkerFailure(
+                "image",
+                BuildIntegrityError("PAYLOAD_LENGTH_MISMATCH", "payload_len is outside allowed range"));
             return;
         }
 
         std::vector<uint8_t> payload(header.payload_len);
         if (!image_client_.RecvAll(payload.data(), payload.size(), &error))
         {
-            HandleWorkerFailure("image", error);
+            HandleWorkerFailure(
+                "image",
+                BuildIntegrityError("PAYLOAD_RECEIVE_FAILED", error));
             return;
         }
 
@@ -284,7 +331,12 @@ void SpectraBridgeClient::ImageReceiveLoop()
             const uint32_t actual_crc = util::ComputeCrc32(payload.data(), payload.size());
             if (actual_crc != header.crc32)
             {
-                HandleWorkerFailure("image", "payload CRC32 mismatch");
+                HandleWorkerFailure(
+                    "image",
+                    BuildIntegrityError(
+                        "CRC_MISMATCH",
+                        "payload CRC32 mismatch, expected=" + ToHex32(header.crc32) +
+                            ", actual=" + ToHex32(actual_crc)));
                 return;
             }
         }

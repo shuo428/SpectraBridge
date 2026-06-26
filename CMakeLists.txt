@@ -30,6 +30,16 @@ add_executable(MockFpgaServer
     tools/mock-fpga/MockFpgaServer.cpp
 )
 
+add_executable(spectra_bridge_test
+    main.cpp
+    src/image/ImageConverter.cpp
+    src/util/Crc32.cpp
+)
+
+target_include_directories(spectra_bridge_test PRIVATE
+    include
+)
+
 if (WIN32)
     target_link_libraries(SpectraBridgeJni PRIVATE ws2_32)
     target_link_libraries(MockFpgaServer PRIVATE ws2_32)
