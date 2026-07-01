@@ -1,247 +1,821 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include <array>
+#include <cctype>
+#include <condition_variable>
 #include <cstdint>
-#include <functional>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "image/ImageConverter.h"
 #include "network/ByteUtils.h"
+#include "protocol/ControlProtocol.h"
 #include "protocol/ImageProtocol.h"
 #include "util/Crc32.h"
 
+#pragma comment(lib, "ws2_32.lib")
+
 namespace {
 
-using spectra::network::WriteUint16LE;
-using spectra::network::WriteUint32LE;
-using spectra::protocol::ImageFrameHeader;
-using spectra::protocol::kImageFrameHeaderSize;
-using spectra::protocol::kImageMagic;
-using spectra::protocol::kImageProtocolVersion;
-using spectra::protocol::kPixelFormatRaw16Low12;
+// spectra_bridge_test.exe 现在作为“轻量 Mock FPGA”使用：
+// 1. Java/SpringBoot 仍然通过 DLL 连接 127.0.0.1:5000 / 5001；
+// 2. DLL 的 SpectraBridgeClient 会像连接真实 FPGA 一样接收 header + payload；
+// 3. 因此 ParseImageFrameHeader、payload_len、CRC、RAW12 高位检查都会正常执行；
+// 4. Java 只有在 native 完整性检查通过后才会收到 onImageFrame(...)。
+//
+// 这和直接在测试程序里调用 Java 回调不同：这里不绕过任何接收完整性逻辑。
 
-struct TestRunner {
-    int passed = 0;
-    int failed = 0;
+constexpr uint16_t kDefaultControlPort = 5000;
+constexpr uint16_t kDefaultImagePort = 5001;
 
-    void Run(const std::string& name, const std::function<void()>& test)
-    {
-        try
-        {
-            test();
-            ++passed;
-            std::cout << "[PASS] " << name << std::endl;
-        }
-        catch (const std::exception& ex)
-        {
-            ++failed;
-            std::cout << "[FAIL] " << name << " - " << ex.what() << std::endl;
-        }
-    }
+constexpr uint32_t kImageWidth = 800u;
+constexpr uint32_t kImageHeight = 600u;
+constexpr std::size_t kImagePixelCount =
+    static_cast<std::size_t>(kImageWidth) * static_cast<std::size_t>(kImageHeight);
+constexpr std::size_t kImagePayloadSize = kImagePixelCount * sizeof(uint16_t);
+
+namespace StatusBits {
+constexpr uint16_t BUSY = 1u << 0;
+constexpr uint16_t READY = 1u << 1;
+constexpr uint16_t ERROR_FLAG = 1u << 2;
+constexpr uint16_t IMAGE_READY = 1u << 3;
+constexpr uint16_t CONFIG_APPLIED = 1u << 4;
+}  // namespace StatusBits
+
+struct ProgramOptions {
+    uint16_t control_port = kDefaultControlPort;
+    uint16_t image_port = kDefaultImagePort;
+    std::string image_path;
+    bool self_test = false;
 };
 
-void Require(bool condition, const std::string& message)
+struct StatusSnapshot {
+    bool config_applied = false;
+    bool image_ready = false;
+    bool busy = false;
+    uint16_t error_code = 0;
+};
+
+struct SharedState {
+    std::mutex mutex;
+    std::condition_variable image_cv;
+
+    bool running = true;
+    bool trigger_pending = false;
+    bool config_applied = false;
+    bool image_ready = false;
+    bool busy = false;
+    uint16_t error_code = 0;
+};
+
+std::string NormalizePathForLog(const std::string& path)
 {
-    if (!condition)
+    return path.empty() ? "(empty)" : path;
+}
+
+bool ParseUint16(const std::string& value, uint16_t* output)
+{
+    if (output == NULL)
     {
-        throw std::runtime_error(message);
+        return false;
+    }
+
+    try
+    {
+        int parsed = std::stoi(value);
+        if (parsed < 1 || parsed > 65535)
+        {
+            return false;
+        }
+        *output = static_cast<uint16_t>(parsed);
+        return true;
+    }
+    catch (...)
+    {
+        return false;
     }
 }
 
-void RequireContains(const std::string& value, const std::string& expected)
+void PrintUsage()
 {
-    if (value.find(expected) == std::string::npos)
+    std::cout
+        << "Usage:\n"
+        << "  spectra_bridge_test.exe [--control-port 5000] [--image-port 5001] [--image path.pgm]\n"
+        << "  spectra_bridge_test.exe --self-test\n\n"
+        << "Default image search order:\n"
+        << "  tools/mock-fpga/test-spectrum-800x600.pgm\n"
+        << "  ../tools/mock-fpga/test-spectrum-800x600.pgm\n"
+        << "  D:/GraduationProject/SpectraBridge/tools/mock-fpga/test-spectrum-800x600.pgm\n";
+}
+
+bool ParseOptions(int argc, char** argv, ProgramOptions* options)
+{
+    if (options == NULL)
     {
-        throw std::runtime_error("expected message to contain '" + expected + "', actual: " + value);
+        return false;
     }
-}
 
-std::array<uint8_t, kImageFrameHeaderSize> MakeHeader(uint32_t magic = kImageMagic,
-                                                       uint16_t version = kImageProtocolVersion,
-                                                       uint16_t header_len = static_cast<uint16_t>(kImageFrameHeaderSize),
-                                                       uint32_t payload_len = 8u,
-                                                       uint32_t width = 2u,
-                                                       uint32_t height = 2u,
-                                                       uint32_t pixel_format = kPixelFormatRaw16Low12,
-                                                       uint32_t crc32 = 0u,
-                                                       uint32_t reserved = 0u)
-{
-    std::array<uint8_t, kImageFrameHeaderSize> header = {};
-    WriteUint32LE(magic, header.data());
-    WriteUint16LE(version, header.data() + 4);
-    WriteUint16LE(header_len, header.data() + 6);
-    WriteUint32LE(payload_len, header.data() + 8);
-    WriteUint32LE(width, header.data() + 12);
-    WriteUint32LE(height, header.data() + 16);
-    WriteUint32LE(pixel_format, header.data() + 20);
-    WriteUint32LE(crc32, header.data() + 24);
-    WriteUint32LE(reserved, header.data() + 28);
-    return header;
-}
-
-bool ParseHeader(const std::array<uint8_t, kImageFrameHeaderSize>& wire_header,
-                 ImageFrameHeader* parsed,
-                 std::string* error)
-{
-    return spectra::protocol::ParseImageFrameHeader(wire_header, parsed, error);
-}
-
-std::vector<uint8_t> MakeRaw16Payload(const std::vector<uint16_t>& pixels)
-{
-    std::vector<uint8_t> payload(pixels.size() * sizeof(uint16_t), 0u);
-    for (std::size_t index = 0; index < pixels.size(); ++index)
+    for (int index = 1; index < argc; ++index)
     {
-        WriteUint16LE(pixels[index], payload.data() + index * sizeof(uint16_t));
+        std::string arg = argv[index];
+        if (arg == "--help" || arg == "-h")
+        {
+            PrintUsage();
+            return false;
+        }
+        if (arg == "--self-test")
+        {
+            options->self_test = true;
+            continue;
+        }
+        if (arg == "--control-port" && index + 1 < argc)
+        {
+            if (!ParseUint16(argv[++index], &options->control_port))
+            {
+                std::cerr << "[spectra_bridge_test] invalid --control-port" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--image-port" && index + 1 < argc)
+        {
+            if (!ParseUint16(argv[++index], &options->image_port))
+            {
+                std::cerr << "[spectra_bridge_test] invalid --image-port" << std::endl;
+                return false;
+            }
+            continue;
+        }
+        if (arg == "--image" && index + 1 < argc)
+        {
+            options->image_path = argv[++index];
+            continue;
+        }
+
+        std::cerr << "[spectra_bridge_test] unknown argument: " << arg << std::endl;
+        PrintUsage();
+        return false;
+    }
+
+    return true;
+}
+
+bool FileExists(const std::string& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    return input.good();
+}
+
+std::vector<std::string> BuildImageSearchPaths(const std::string& configured_path)
+{
+    std::vector<std::string> paths;
+    if (!configured_path.empty())
+    {
+        paths.push_back(configured_path);
+    }
+
+    paths.push_back("tools/mock-fpga/test-spectrum-800x600.pgm");
+    paths.push_back("../tools/mock-fpga/test-spectrum-800x600.pgm");
+    paths.push_back("D:/GraduationProject/SpectraBridge/tools/mock-fpga/test-spectrum-800x600.pgm");
+    return paths;
+}
+
+bool ReadPgmToken(std::istream& input, std::string* token)
+{
+    if (token == NULL)
+    {
+        return false;
+    }
+
+    token->clear();
+    while (input.good())
+    {
+        int next = input.peek();
+        if (next == '#')
+        {
+            std::string ignored;
+            std::getline(input, ignored);
+            continue;
+        }
+        if (std::isspace(next))
+        {
+            input.get();
+            continue;
+        }
+        break;
+    }
+
+    return static_cast<bool>(input >> *token);
+}
+
+bool LoadPgm8(const std::string& path, std::vector<uint8_t>* image8, std::string* error)
+{
+    if (image8 == NULL)
+    {
+        return false;
+    }
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+    {
+        if (error != NULL)
+        {
+            *error = "cannot open PGM image: " + path;
+        }
+        return false;
+    }
+
+    std::string magic;
+    std::string width_text;
+    std::string height_text;
+    std::string max_value_text;
+
+    if (!ReadPgmToken(input, &magic) ||
+        !ReadPgmToken(input, &width_text) ||
+        !ReadPgmToken(input, &height_text) ||
+        !ReadPgmToken(input, &max_value_text))
+    {
+        if (error != NULL)
+        {
+            *error = "invalid PGM header";
+        }
+        return false;
+    }
+
+    if (magic != "P5")
+    {
+        if (error != NULL)
+        {
+            *error = "only binary PGM P5 is supported";
+        }
+        return false;
+    }
+
+    const int width = std::stoi(width_text);
+    const int height = std::stoi(height_text);
+    const int max_value = std::stoi(max_value_text);
+    if (width != static_cast<int>(kImageWidth) ||
+        height != static_cast<int>(kImageHeight) ||
+        max_value != 255)
+    {
+        if (error != NULL)
+        {
+            std::ostringstream message;
+            message << "PGM must be 800x600 maxval=255, actual "
+                    << width << "x" << height << " maxval=" << max_value;
+            *error = message.str();
+        }
+        return false;
+    }
+
+    // PGM header 后面会有一个空白字符；读掉它后就是 width*height 字节灰度数据。
+    input.get();
+
+    image8->assign(kImagePixelCount, 0u);
+    input.read(reinterpret_cast<char*>(image8->data()), static_cast<std::streamsize>(image8->size()));
+    if (input.gcount() != static_cast<std::streamsize>(image8->size()))
+    {
+        if (error != NULL)
+        {
+            *error = "PGM pixel data is shorter than expected";
+        }
+        return false;
+    }
+
+    return true;
+}
+
+std::vector<uint8_t> BuildFallbackSpectrumImage8()
+{
+    std::vector<uint8_t> image(kImagePixelCount, 8u);
+
+    const int line_positions[] = {38, 148, 196, 257, 300, 343, 383, 492, 631, 657, 681, 718, 742};
+    const int line_strengths[] = {50, 170, 110, 90, 140, 200, 150, 255, 245, 120, 95, 160, 80};
+
+    for (uint32_t y = 0; y < kImageHeight; ++y)
+    {
+        for (uint32_t x = 0; x < kImageWidth; ++x)
+        {
+            int value = 10 + static_cast<int>((y * 8u) / kImageHeight);
+
+            for (std::size_t line = 0; line < sizeof(line_positions) / sizeof(line_positions[0]); ++line)
+            {
+                int dx = static_cast<int>(x) - line_positions[line];
+                int abs_dx = dx < 0 ? -dx : dx;
+                if (abs_dx <= 14)
+                {
+                    int contribution = line_strengths[line] / (1 + abs_dx * abs_dx);
+                    value += contribution;
+                }
+            }
+
+            if (((x * 17u + y * 31u) % 997u) == 0u)
+            {
+                value = 220;
+            }
+
+            if (value > 255)
+            {
+                value = 255;
+            }
+
+            image[static_cast<std::size_t>(y) * kImageWidth + x] = static_cast<uint8_t>(value);
+        }
+    }
+
+    return image;
+}
+
+std::vector<uint8_t> LoadConfiguredImage8(const ProgramOptions& options, std::string* loaded_path)
+{
+    std::vector<std::string> paths = BuildImageSearchPaths(options.image_path);
+    for (const std::string& path : paths)
+    {
+        if (!FileExists(path))
+        {
+            continue;
+        }
+
+        std::vector<uint8_t> image8;
+        std::string error;
+        if (LoadPgm8(path, &image8, &error))
+        {
+            if (loaded_path != NULL)
+            {
+                *loaded_path = path;
+            }
+            return image8;
+        }
+
+        std::cerr << "[spectra_bridge_test] failed to load "
+                  << NormalizePathForLog(path) << ": " << error << std::endl;
+    }
+
+    if (loaded_path != NULL)
+    {
+        *loaded_path = "(generated fallback)";
+    }
+    std::cout << "[spectra_bridge_test] PGM image not found, using generated fallback spectrum" << std::endl;
+    return BuildFallbackSpectrumImage8();
+}
+
+std::vector<uint8_t> ConvertGray8ToRaw16Low12Payload(const std::vector<uint8_t>& image8)
+{
+    std::vector<uint8_t> payload(kImagePayloadSize, 0u);
+    for (std::size_t pixel_index = 0; pixel_index < image8.size(); ++pixel_index)
+    {
+        // 8-bit 测试图只是人眼预览用灰度；模拟 FPGA 发送时扩展成 RAW12 DN。
+        // 高 4 位必须为 0，否则 native 的 INVALID_HIGH_BITS 检查会正确拦截。
+        const uint16_t pixel12 =
+            static_cast<uint16_t>((static_cast<uint32_t>(image8[pixel_index]) * 4095u) / 255u);
+        spectra::network::WriteUint16LE(pixel12, payload.data() + pixel_index * sizeof(uint16_t));
     }
     return payload;
 }
 
-void ExpectHeaderRejected(const std::array<uint8_t, kImageFrameHeaderSize>& wire_header,
-                          const std::string& expected_code)
+bool SendAll(SOCKET socket_handle, const uint8_t* data, std::size_t size)
 {
-    ImageFrameHeader parsed = {};
+    std::size_t total_sent = 0u;
+
+    while (total_sent < size)
+    {
+        const int sent = send(socket_handle,
+                              reinterpret_cast<const char*>(data + total_sent),
+                              static_cast<int>(size - total_sent),
+                              0);
+        if (sent <= 0)
+        {
+            return false;
+        }
+
+        total_sent += static_cast<std::size_t>(sent);
+    }
+
+    return true;
+}
+
+bool RecvAll(SOCKET socket_handle, uint8_t* data, std::size_t size)
+{
+    std::size_t total_received = 0u;
+
+    while (total_received < size)
+    {
+        const int received = recv(socket_handle,
+                                  reinterpret_cast<char*>(data + total_received),
+                                  static_cast<int>(size - total_received),
+                                  0);
+        if (received <= 0)
+        {
+            return false;
+        }
+
+        total_received += static_cast<std::size_t>(received);
+    }
+
+    return true;
+}
+
+SOCKET CreateListenSocket(uint16_t port)
+{
+    SOCKET listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listen_socket == INVALID_SOCKET)
+    {
+        return INVALID_SOCKET;
+    }
+
+    const BOOL reuse = 1;
+    setsockopt(listen_socket,
+               SOL_SOCKET,
+               SO_REUSEADDR,
+               reinterpret_cast<const char*>(&reuse),
+               sizeof(reuse));
+
+    sockaddr_in address;
+    std::memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons(port);
+
+    if (bind(listen_socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0)
+    {
+        closesocket(listen_socket);
+        return INVALID_SOCKET;
+    }
+
+    if (listen(listen_socket, 1) != 0)
+    {
+        closesocket(listen_socket);
+        return INVALID_SOCKET;
+    }
+
+    return listen_socket;
+}
+
+StatusSnapshot MakeStatusSnapshot(const SharedState& state)
+{
+    StatusSnapshot snapshot;
+    snapshot.config_applied = state.config_applied;
+    snapshot.image_ready = state.image_ready;
+    snapshot.busy = state.busy;
+    snapshot.error_code = state.error_code;
+    return snapshot;
+}
+
+uint16_t BuildStatusBits(const StatusSnapshot& state)
+{
+    uint16_t bits = 0u;
+    bits |= state.busy ? StatusBits::BUSY : StatusBits::READY;
+    if (state.error_code != 0u)
+    {
+        bits |= StatusBits::ERROR_FLAG;
+    }
+    if (state.image_ready)
+    {
+        bits |= StatusBits::IMAGE_READY;
+    }
+    if (state.config_applied)
+    {
+        bits |= StatusBits::CONFIG_APPLIED;
+    }
+    return bits;
+}
+
+bool SendStatusPacket(SOCKET control_socket, const SharedState& state)
+{
+    StatusSnapshot snapshot = MakeStatusSnapshot(state);
+
+    std::array<uint8_t, spectra::protocol::kStatusPacketSize> packet = {};
+    packet[0] = static_cast<uint8_t>(spectra::protocol::MsgType::ReturnStatus);
+    spectra::network::WriteUint16LE(BuildStatusBits(snapshot), packet.data() + 1);
+    spectra::network::WriteUint16LE(snapshot.error_code, packet.data() + 3);
+    return SendAll(control_socket, packet.data(), packet.size());
+}
+
+bool SendConfigAckPacket(SOCKET control_socket, uint16_t result_code, uint16_t failed_addr)
+{
+    std::array<uint8_t, spectra::protocol::kConfigAckPacketSize> packet = {};
+    packet[0] = static_cast<uint8_t>(spectra::protocol::MsgType::ConfigAck);
+    spectra::network::WriteUint16LE(result_code, packet.data() + 1);
+    spectra::network::WriteUint16LE(failed_addr, packet.data() + 3);
+    return SendAll(control_socket, packet.data(), packet.size());
+}
+
+bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const std::vector<uint8_t>& image8)
+{
+    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image8);
+    const uint32_t payload_crc32 = spectra::util::ComputeCrc32(payload.data(), payload.size());
+
+    std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
+    spectra::network::WriteUint32LE(spectra::protocol::kImageMagic, header.data() + 0);
+    spectra::network::WriteUint16LE(spectra::protocol::kImageProtocolVersion, header.data() + 4);
+    spectra::network::WriteUint16LE(
+        static_cast<uint16_t>(spectra::protocol::kImageFrameHeaderSize), header.data() + 6);
+    spectra::network::WriteUint32LE(static_cast<uint32_t>(payload.size()), header.data() + 8);
+    spectra::network::WriteUint32LE(kImageWidth, header.data() + 12);
+    spectra::network::WriteUint32LE(kImageHeight, header.data() + 16);
+    spectra::network::WriteUint32LE(spectra::protocol::kPixelFormatRaw16Low12, header.data() + 20);
+    spectra::network::WriteUint32LE(payload_crc32, header.data() + 24);
+    spectra::network::WriteUint32LE(0u, header.data() + 28);
+
+    if (!SendAll(image_socket, header.data(), header.size()))
+    {
+        return false;
+    }
+    if (!SendAll(image_socket, payload.data(), payload.size()))
+    {
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.image_ready = true;
+        state.busy = false;
+    }
+
+    std::cout << "[spectra_bridge_test] image frame sent, payload="
+              << payload.size() << " bytes, crc32=0x"
+              << std::hex << std::uppercase << payload_crc32 << std::dec << std::endl;
+    return true;
+}
+
+void ControlThreadMain(SOCKET control_socket, SharedState& state)
+{
+    while (true)
+    {
+        uint8_t msg_type = 0u;
+        if (!RecvAll(control_socket, &msg_type, 1u))
+        {
+            std::cout << "[spectra_bridge_test] control client disconnected" << std::endl;
+            return;
+        }
+
+        if (msg_type == static_cast<uint8_t>(spectra::protocol::MsgType::Control))
+        {
+            std::array<uint8_t, 2> body = {};
+            if (!RecvAll(control_socket, body.data(), body.size()))
+            {
+                return;
+            }
+
+            const uint16_t control_bits = spectra::network::ReadUint16LE(body.data());
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+
+                if ((control_bits & spectra::protocol::ControlBits::RESET) != 0u)
+                {
+                    state.trigger_pending = false;
+                    state.config_applied = false;
+                    state.image_ready = false;
+                    state.busy = false;
+                    state.error_code = 0u;
+                    std::cout << "[spectra_bridge_test] RESET received" << std::endl;
+                }
+
+                if ((control_bits & spectra::protocol::ControlBits::TRIGGER_ONCE) != 0u)
+                {
+                    state.trigger_pending = true;
+                    state.image_ready = false;
+                    state.busy = true;
+                    std::cout << "[spectra_bridge_test] TRIGGER_ONCE received" << std::endl;
+                }
+            }
+
+            state.image_cv.notify_one();
+
+            StatusSnapshot snapshot;
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                snapshot = MakeStatusSnapshot(state);
+            }
+
+            std::array<uint8_t, spectra::protocol::kStatusPacketSize> packet = {};
+            packet[0] = static_cast<uint8_t>(spectra::protocol::MsgType::ReturnStatus);
+            spectra::network::WriteUint16LE(BuildStatusBits(snapshot), packet.data() + 1);
+            spectra::network::WriteUint16LE(snapshot.error_code, packet.data() + 3);
+            if (!SendAll(control_socket, packet.data(), packet.size()))
+            {
+                return;
+            }
+            continue;
+        }
+
+        if (msg_type == static_cast<uint8_t>(spectra::protocol::MsgType::QueryStatus))
+        {
+            std::array<uint8_t, 2> body = {};
+            if (!RecvAll(control_socket, body.data(), body.size()))
+            {
+                return;
+            }
+
+            std::cout << "[spectra_bridge_test] QUERY_STATUS received" << std::endl;
+            std::lock_guard<std::mutex> lock(state.mutex);
+            if (!SendStatusPacket(control_socket, state))
+            {
+                return;
+            }
+            continue;
+        }
+
+        if (msg_type == static_cast<uint8_t>(spectra::protocol::MsgType::Config))
+        {
+            std::array<uint8_t, 2> payload_len_bytes = {};
+            if (!RecvAll(control_socket, payload_len_bytes.data(), payload_len_bytes.size()))
+            {
+                return;
+            }
+
+            const uint16_t payload_len = spectra::network::ReadUint16LE(payload_len_bytes.data());
+            std::vector<uint8_t> regs(payload_len, 0u);
+            if (!RecvAll(control_socket, regs.data(), regs.size()))
+            {
+                return;
+            }
+
+            std::cout << "[spectra_bridge_test] CONFIG received, payload_len="
+                      << payload_len << std::endl;
+
+            const bool config_ok = (payload_len == spectra::protocol::kFullConfigPayloadSize);
+            {
+                std::lock_guard<std::mutex> lock(state.mutex);
+                state.config_applied = config_ok;
+                state.error_code = config_ok ? 0u : 1u;
+            }
+
+            if (!SendConfigAckPacket(control_socket,
+                                     config_ok ? 0u : 1u,
+                                     config_ok ? 0u : 0x0001u))
+            {
+                return;
+            }
+            continue;
+        }
+
+        std::cout << "[spectra_bridge_test] unsupported msg_type="
+                  << static_cast<int>(msg_type) << std::endl;
+        return;
+    }
+}
+
+void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<uint8_t>& image8)
+{
+    while (true)
+    {
+        {
+            std::unique_lock<std::mutex> lock(state.mutex);
+            state.image_cv.wait(lock, [&state] {
+                return !state.running || state.trigger_pending;
+            });
+
+            if (!state.running)
+            {
+                return;
+            }
+            state.trigger_pending = false;
+        }
+
+        std::cout << "[spectra_bridge_test] sending configured spectrum image" << std::endl;
+        if (!SendOneImageFrame(image_socket, state, image8))
+        {
+            std::cout << "[spectra_bridge_test] image client disconnected" << std::endl;
+            return;
+        }
+    }
+}
+
+int RunSelfTest(const ProgramOptions& options)
+{
+    std::string loaded_path;
+    std::vector<uint8_t> image8 = LoadConfiguredImage8(options, &loaded_path);
+    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image8);
+
     std::string error;
-    Require(!ParseHeader(wire_header, &parsed, &error), "header should be rejected");
-    RequireContains(error, expected_code);
+    std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
+    spectra::network::WriteUint32LE(spectra::protocol::kImageMagic, header.data() + 0);
+    spectra::network::WriteUint16LE(spectra::protocol::kImageProtocolVersion, header.data() + 4);
+    spectra::network::WriteUint16LE(
+        static_cast<uint16_t>(spectra::protocol::kImageFrameHeaderSize), header.data() + 6);
+    spectra::network::WriteUint32LE(static_cast<uint32_t>(payload.size()), header.data() + 8);
+    spectra::network::WriteUint32LE(kImageWidth, header.data() + 12);
+    spectra::network::WriteUint32LE(kImageHeight, header.data() + 16);
+    spectra::network::WriteUint32LE(spectra::protocol::kPixelFormatRaw16Low12, header.data() + 20);
+    spectra::network::WriteUint32LE(spectra::util::ComputeCrc32(payload.data(), payload.size()), header.data() + 24);
+
+    spectra::protocol::ImageFrameHeader parsed = {};
+    if (!spectra::protocol::ParseImageFrameHeader(header, &parsed, &error))
+    {
+        std::cerr << "[spectra_bridge_test] self-test failed: " << error << std::endl;
+        return 1;
+    }
+
+    std::cout << "[spectra_bridge_test] self-test OK" << std::endl;
+    std::cout << "  image=" << loaded_path << std::endl;
+    std::cout << "  dimensions=" << parsed.width << "x" << parsed.height << std::endl;
+    std::cout << "  payload=" << parsed.payload_len << " bytes" << std::endl;
+    std::cout << "  crc32=0x" << std::hex << std::uppercase << parsed.crc32 << std::dec << std::endl;
+    return 0;
 }
 
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    TestRunner runner;
+    ProgramOptions options;
+    if (!ParseOptions(argc, argv, &options))
+    {
+        return 1;
+    }
 
-    runner.Run("valid image header is accepted", [] {
-        ImageFrameHeader parsed = {};
-        std::string error;
-        Require(ParseHeader(MakeHeader(), &parsed, &error), "valid header rejected: " + error);
-        Require(parsed.magic == kImageMagic, "magic not parsed");
-        Require(parsed.version == kImageProtocolVersion, "version not parsed");
-        Require(parsed.header_len == kImageFrameHeaderSize, "header_len not parsed");
-        Require(parsed.payload_len == 8u, "payload_len not parsed");
-        Require(parsed.width == 2u && parsed.height == 2u, "dimensions not parsed");
-        Require(parsed.pixel_format == kPixelFormatRaw16Low12, "pixel_format not parsed");
-    });
+    if (options.self_test)
+    {
+        return RunSelfTest(options);
+    }
 
-    runner.Run("invalid magic is rejected", [] {
-        ExpectHeaderRejected(MakeHeader(0x12345678u), "[INVALID_MAGIC]");
-    });
+    std::string loaded_path;
+    std::vector<uint8_t> image8 = LoadConfiguredImage8(options, &loaded_path);
+    std::cout << "[spectra_bridge_test] loaded image: " << loaded_path << std::endl;
+    std::cout << "[spectra_bridge_test] image protocol: 800x600 RAW16_LOW12 + CRC32" << std::endl;
 
-    runner.Run("unsupported protocol version is rejected", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic, 2u), "[UNSUPPORTED_VERSION]");
-    });
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
+    {
+        std::cerr << "[spectra_bridge_test] WSAStartup failed" << std::endl;
+        return 1;
+    }
 
-    runner.Run("invalid header length is rejected", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        static_cast<uint16_t>(kImageFrameHeaderSize - 1u)),
-                             "[INVALID_HEADER_LENGTH]");
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        257u),
-                             "[INVALID_HEADER_LENGTH]");
-    });
+    SOCKET control_listen_socket = CreateListenSocket(options.control_port);
+    SOCKET image_listen_socket = CreateListenSocket(options.image_port);
+    if (control_listen_socket == INVALID_SOCKET || image_listen_socket == INVALID_SOCKET)
+    {
+        std::cerr << "[spectra_bridge_test] failed to create listen sockets. "
+                  << "Are ports " << options.control_port << " and "
+                  << options.image_port << " already in use?" << std::endl;
 
-    runner.Run("zero dimensions are rejected", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        static_cast<uint16_t>(kImageFrameHeaderSize),
-                                        0u,
-                                        0u,
-                                        2u),
-                             "[INVALID_DIMENSIONS]");
-    });
+        if (control_listen_socket != INVALID_SOCKET)
+        {
+            closesocket(control_listen_socket);
+        }
+        if (image_listen_socket != INVALID_SOCKET)
+        {
+            closesocket(image_listen_socket);
+        }
+        WSACleanup();
+        return 1;
+    }
 
-    runner.Run("invalid pixel format is rejected", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        static_cast<uint16_t>(kImageFrameHeaderSize),
-                                        8u,
-                                        2u,
-                                        2u,
-                                        0x99999999u),
-                             "[INVALID_PIXEL_FORMAT]");
-    });
+    std::cout << "[spectra_bridge_test] waiting for control connection on port "
+              << options.control_port << std::endl;
+    SOCKET control_socket = accept(control_listen_socket, NULL, NULL);
+    if (control_socket == INVALID_SOCKET)
+    {
+        std::cerr << "[spectra_bridge_test] accept(control) failed" << std::endl;
+        closesocket(control_listen_socket);
+        closesocket(image_listen_socket);
+        WSACleanup();
+        return 1;
+    }
+    std::cout << "[spectra_bridge_test] control connected" << std::endl;
 
-    runner.Run("reserved field must be zero", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        static_cast<uint16_t>(kImageFrameHeaderSize),
-                                        8u,
-                                        2u,
-                                        2u,
-                                        kPixelFormatRaw16Low12,
-                                        0u,
-                                        1u),
-                             "[INVALID_RESERVED_FIELD]");
-    });
+    std::cout << "[spectra_bridge_test] waiting for image connection on port "
+              << options.image_port << std::endl;
+    SOCKET image_socket = accept(image_listen_socket, NULL, NULL);
+    if (image_socket == INVALID_SOCKET)
+    {
+        std::cerr << "[spectra_bridge_test] accept(image) failed" << std::endl;
+        closesocket(control_socket);
+        closesocket(control_listen_socket);
+        closesocket(image_listen_socket);
+        WSACleanup();
+        return 1;
+    }
+    std::cout << "[spectra_bridge_test] image connected" << std::endl;
 
-    runner.Run("payload length must equal width * height * 2", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        static_cast<uint16_t>(kImageFrameHeaderSize),
-                                        6u,
-                                        2u,
-                                        2u),
-                             "[PAYLOAD_LENGTH_MISMATCH]");
-    });
+    SharedState state;
+    std::thread control_thread(ControlThreadMain, control_socket, std::ref(state));
+    std::thread image_thread(ImageThreadMain, image_socket, std::ref(state), std::cref(image8));
 
-    runner.Run("payload size calculation overflow is rejected", [] {
-        ExpectHeaderRejected(MakeHeader(kImageMagic,
-                                        kImageProtocolVersion,
-                                        static_cast<uint16_t>(kImageFrameHeaderSize),
-                                        8u,
-                                        0xFFFFFFFFu,
-                                        0xFFFFFFFFu),
-                             "[INVALID_DIMENSIONS]");
-    });
+    control_thread.join();
 
-    runner.Run("RAW16 low12 payload converts to 16-bit and 8-bit buffers", [] {
-        const std::vector<uint8_t> payload = MakeRaw16Payload({0u, 17u, 2048u, 4095u});
-        spectra::image::ConvertedImageFrame frame = {};
-        std::string error;
-        Require(spectra::image::ConvertRaw16Low12ToGray(payload, 2u, 2u, &frame, &error),
-                "valid payload rejected: " + error);
-        Require(frame.width == 2u && frame.height == 2u, "converted dimensions are wrong");
-        Require(frame.pixels16.size() == 4u && frame.pixels8.size() == 4u, "converted buffer sizes are wrong");
-        Require(frame.pixels16[0] == 0u, "pixel16[0] wrong");
-        Require(frame.pixels16[1] == 17u, "pixel16[1] wrong");
-        Require(frame.pixels16[2] == 2048u, "pixel16[2] wrong");
-        Require(frame.pixels16[3] == 4095u, "pixel16[3] wrong");
-        Require(frame.pixels8[0] == 0u, "pixel8[0] wrong");
-        Require(frame.pixels8[3] == 255u, "pixel8[3] wrong");
-    });
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.running = false;
+    }
+    state.image_cv.notify_all();
 
-    runner.Run("RAW16 high bits are rejected before masking", [] {
-        const std::vector<uint8_t> payload = MakeRaw16Payload({0x1000u, 0u, 0u, 0u});
-        spectra::image::ConvertedImageFrame frame = {};
-        std::string error;
-        Require(!spectra::image::ConvertRaw16Low12ToGray(payload, 2u, 2u, &frame, &error),
-                "payload with non-zero high bits should be rejected");
-        RequireContains(error, "[INVALID_HIGH_BITS]");
-    });
+    shutdown(image_socket, SD_BOTH);
+    closesocket(image_socket);
+    image_thread.join();
 
-    runner.Run("RAW16 payload size mismatch is rejected", [] {
-        const std::vector<uint8_t> payload = MakeRaw16Payload({0u, 1u, 2u});
-        spectra::image::ConvertedImageFrame frame = {};
-        std::string error;
-        Require(!spectra::image::ConvertRaw16Low12ToGray(payload, 2u, 2u, &frame, &error),
-                "short payload should be rejected");
-        RequireContains(error, "[PAYLOAD_LENGTH_MISMATCH]");
-    });
+    closesocket(control_socket);
+    closesocket(control_listen_socket);
+    closesocket(image_listen_socket);
+    WSACleanup();
 
-    runner.Run("CRC32 implementation matches standard check value", [] {
-        const char* text = "123456789";
-        const uint32_t crc = spectra::util::ComputeCrc32(
-            reinterpret_cast<const uint8_t*>(text),
-            9u);
-        Require(crc == 0xCBF43926u, "CRC32 check value mismatch");
-    });
-
-    std::cout << std::endl
-              << "SpectraBridge integrity tests: "
-              << runner.passed << " passed, "
-              << runner.failed << " failed" << std::endl;
-
-    return runner.failed == 0 ? 0 : 1;
+    std::cout << "[spectra_bridge_test] stopped" << std::endl;
+    return 0;
 }

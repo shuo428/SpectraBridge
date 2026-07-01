@@ -43,4 +43,5 @@ target_include_directories(spectra_bridge_test PRIVATE
 if (WIN32)
     target_link_libraries(SpectraBridgeJni PRIVATE ws2_32)
     target_link_libraries(MockFpgaServer PRIVATE ws2_32)
+    target_link_libraries(spectra_bridge_test PRIVATE ws2_32)
 endif()

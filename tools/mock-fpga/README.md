@@ -2,6 +2,16 @@
 
 这个目录下的程序用于在本机模拟 FPGA，方便你直接通过 Java 前端按钮联调 JNI 和 native TCP 逻辑。
 
+当前项目根目录下的 `spectra_bridge_test.exe` 也被改成了同样用途的轻量 Mock FPGA 服务端。
+它默认读取：
+
+```text
+tools/mock-fpga/test-spectrum-800x600.pgm
+```
+
+这张图由真实光谱截图居中裁剪/缩放到 `800 x 600`，运行时会被转换成 `RAW16_LOW12`
+并按 FPGA 图像协议发送给 Java/DLL。
+
 ## 作用
 
 - 开两条 TCP 监听
@@ -32,7 +42,7 @@ g++ -std=c++17 tools\mock-fpga\MockFpgaServer.cpp -lws2_32 -o tools\mock-fpga\Mo
 
 ## 运行顺序
 
-1. 先启动 `MockFpgaServer.exe`
+1. 先启动 `MockFpgaServer.exe` 或项目根目录的 `spectra_bridge_test.exe`
 2. 再启动你的 Java 程序
 3. 让 Java/JNI 客户端连接：
    - 控制 TCP：`127.0.0.1:5000`
@@ -49,3 +59,12 @@ g++ -std=c++17 tools\mock-fpga\MockFpgaServer.cpp -lws2_32 -o tools\mock-fpga\Mo
 - 点击“单次触发”后：
   - 先可能收到一次 `onStatus(...)`
   - 然后收到 `onImageFrame(...)`
+
+## spectra_bridge_test.exe 自检
+
+```powershell
+.\spectra_bridge_test.exe --self-test
+```
+
+自检会验证测试图能被加载、payload 长度为 `960000 bytes`，并且图像头能通过
+当前 `ParseImageFrameHeader` 检查。
