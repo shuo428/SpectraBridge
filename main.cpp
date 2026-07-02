@@ -1,6 +1,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <condition_variable>
@@ -53,6 +54,11 @@ struct ProgramOptions {
     uint16_t image_port = kDefaultImagePort;
     std::string image_path;
     bool self_test = false;
+};
+
+struct TestImage {
+    std::string name;
+    std::vector<uint8_t> pixels8;
 };
 
 struct StatusSnapshot {
@@ -108,10 +114,8 @@ void PrintUsage()
         << "Usage:\n"
         << "  spectra_bridge_test.exe [--control-port 5000] [--image-port 5001] [--image path.pgm]\n"
         << "  spectra_bridge_test.exe --self-test\n\n"
-        << "Default image search order:\n"
-        << "  tools/mock-fpga/test-spectrum-800x600.pgm\n"
-        << "  ../tools/mock-fpga/test-spectrum-800x600.pgm\n"
-        << "  D:/GraduationProject/SpectraBridge/tools/mock-fpga/test-spectrum-800x600.pgm\n";
+        << "If --image is omitted, the program cycles through an in-memory PASS,\n"
+        << "WARNING and FAIL spectrum image bank, one image for each trigger.\n";
 }
 
 bool ParseOptions(int argc, char** argv, ProgramOptions* options)
@@ -179,10 +183,6 @@ std::vector<std::string> BuildImageSearchPaths(const std::string& configured_pat
     {
         paths.push_back(configured_path);
     }
-
-    paths.push_back("tools/mock-fpga/test-spectrum-800x600.pgm");
-    paths.push_back("../tools/mock-fpga/test-spectrum-800x600.pgm");
-    paths.push_back("D:/GraduationProject/SpectraBridge/tools/mock-fpga/test-spectrum-800x600.pgm");
     return paths;
 }
 
@@ -332,8 +332,169 @@ std::vector<uint8_t> BuildFallbackSpectrumImage8()
     return image;
 }
 
-std::vector<uint8_t> LoadConfiguredImage8(const ProgramOptions& options, std::string* loaded_path)
+uint32_t HashPixel(uint32_t x, uint32_t y, uint32_t seed)
 {
+    uint32_t value = x * 374761393u + y * 668265263u + seed * 2246822519u;
+    value ^= value >> 13u;
+    value *= 1274126177u;
+    value ^= value >> 16u;
+    return value;
+}
+
+int ClampGray8(int value)
+{
+    if (value < 0)
+    {
+        return 0;
+    }
+    if (value > 255)
+    {
+        return 255;
+    }
+    return value;
+}
+
+int BroadLineContribution(uint32_t x, int center, int strength, int half_width)
+{
+    const int dx = static_cast<int>(x) - center;
+    const int width2 = half_width * half_width;
+    return (strength * width2) / (dx * dx + width2);
+}
+
+std::vector<uint8_t> BuildQualitySpectrumImage8(uint32_t seed, int variant)
+{
+    std::vector<uint8_t> image(kImagePixelCount, 0u);
+
+    const int centers[6][6] = {
+        {88, 176, 292, 421, 558, 698},
+        {62, 205, 318, 462, 610, 735},
+        {116, 244, 372, 496, 646, 724},
+        {74, 188, 352, 510, 632, 758},
+        {98, 226, 338, 455, 584, 710},
+        {132, 264, 404, 536, 668, 748},
+    };
+    const int strengths[6][6] = {
+        {42, 64, 50, 72, 58, 44},
+        {36, 54, 68, 48, 62, 40},
+        {52, 46, 74, 54, 42, 56},
+        {44, 60, 42, 70, 48, 38},
+        {40, 58, 52, 66, 46, 54},
+        {34, 62, 44, 58, 72, 36},
+    };
+    const int widths[6][6] = {
+        {18, 24, 22, 28, 24, 20},
+        {22, 26, 30, 24, 28, 22},
+        {20, 24, 32, 26, 24, 20},
+        {24, 28, 22, 30, 26, 22},
+        {18, 26, 24, 28, 24, 20},
+        {24, 30, 22, 26, 32, 24},
+    };
+
+    const int profile = variant % 6;
+    for (uint32_t y = 0; y < kImageHeight; ++y)
+    {
+        const int vertical_gradient = static_cast<int>((y * (8u + static_cast<uint32_t>(variant % 4))) / kImageHeight);
+        const int soft_vignetting = static_cast<int>(((y > kImageHeight / 2u ? y - kImageHeight / 2u : kImageHeight / 2u - y) * 5u) /
+                                                     (kImageHeight / 2u));
+
+        for (uint32_t x = 0; x < kImageWidth; ++x)
+        {
+            int value = 28 + vertical_gradient - soft_vignetting;
+            value += static_cast<int>((x * static_cast<uint32_t>(6 + (variant % 5))) / kImageWidth);
+
+            for (int line = 0; line < 6; ++line)
+            {
+                value += BroadLineContribution(x,
+                                               centers[profile][line],
+                                               strengths[profile][line],
+                                               widths[profile][line]);
+            }
+
+            // 轻微、连续的伪噪声只用于让测试图更像真实相机读数。
+            // 振幅控制在很小范围内，避免触发坏点或异常行/列 FAIL。
+            const uint32_t noise = HashPixel(x, y, seed) % 7u;
+            value += static_cast<int>(noise) - 3;
+
+            image[static_cast<std::size_t>(y) * kImageWidth + x] =
+                static_cast<uint8_t>(ClampGray8(value));
+        }
+    }
+
+    return image;
+}
+
+void AddMildHotPixels(std::vector<uint8_t>* image, uint32_t seed, int count)
+{
+    if (image == NULL)
+    {
+        return;
+    }
+
+    uint32_t state = seed == 0u ? 1u : seed;
+    for (int index = 0; index < count; ++index)
+    {
+        state = state * 1664525u + 1013904223u;
+        const uint32_t x = 1u + (state % (kImageWidth - 2u));
+        state = state * 1664525u + 1013904223u;
+        const uint32_t y = 1u + (state % (kImageHeight - 2u));
+        const std::size_t pixel_index = static_cast<std::size_t>(y) * kImageWidth + x;
+        (*image)[pixel_index] = 214u;
+    }
+}
+
+void AddSaturationBlock(std::vector<uint8_t>* image, uint32_t left, uint32_t top, uint32_t width, uint32_t height)
+{
+    if (image == NULL)
+    {
+        return;
+    }
+
+    const uint32_t right = std::min(left + width, kImageWidth);
+    const uint32_t bottom = std::min(top + height, kImageHeight);
+    for (uint32_t y = top; y < bottom; ++y)
+    {
+        for (uint32_t x = left; x < right; ++x)
+        {
+            (*image)[static_cast<std::size_t>(y) * kImageWidth + x] = 255u;
+        }
+    }
+}
+
+std::vector<TestImage> BuildGeneratedQualityImageBank()
+{
+    std::vector<TestImage> bank;
+    bank.push_back({"PASS stable spectrum", BuildQualitySpectrumImage8(101u, 0)});
+
+    TestImage warning;
+    warning.name = "WARNING mild hot pixels";
+    warning.pixels8 = BuildQualitySpectrumImage8(202u, 1);
+    // 120 个离散热坏点预计超过后端 badPixelWarningCount=60，
+    // 但低于 badPixelFailCount=500，用于稳定触发 WARNING。
+    AddMildHotPixels(&warning.pixels8, 909u, 120);
+    bank.push_back(warning);
+
+    TestImage fail;
+    fail.name = "FAIL saturated block";
+    fail.pixels8 = BuildQualitySpectrumImage8(303u, 2);
+    // 80 * 80 = 6400 个满量程像素，占 800*600 的 1.33%，
+    // 高于后端 saturationFailRatio=1%，用于稳定触发 FAIL。
+    AddSaturationBlock(&fail.pixels8, 360u, 120u, 80u, 80u);
+    bank.push_back(fail);
+
+    return bank;
+}
+
+std::vector<TestImage> LoadConfiguredImageBank(const ProgramOptions& options, std::string* loaded_description)
+{
+    if (options.image_path.empty())
+    {
+        if (loaded_description != NULL)
+        {
+            *loaded_description = "(generated PASS/WARNING/FAIL cyclic test image bank)";
+        }
+        return BuildGeneratedQualityImageBank();
+    }
+
     std::vector<std::string> paths = BuildImageSearchPaths(options.image_path);
     for (const std::string& path : paths)
     {
@@ -346,23 +507,23 @@ std::vector<uint8_t> LoadConfiguredImage8(const ProgramOptions& options, std::st
         std::string error;
         if (LoadPgm8(path, &image8, &error))
         {
-            if (loaded_path != NULL)
+            if (loaded_description != NULL)
             {
-                *loaded_path = path;
+                *loaded_description = path;
             }
-            return image8;
+            return std::vector<TestImage>{{path, image8}};
         }
 
         std::cerr << "[spectra_bridge_test] failed to load "
                   << NormalizePathForLog(path) << ": " << error << std::endl;
     }
 
-    if (loaded_path != NULL)
+    if (loaded_description != NULL)
     {
-        *loaded_path = "(generated fallback)";
+        *loaded_description = "(generated fallback)";
     }
     std::cout << "[spectra_bridge_test] PGM image not found, using generated fallback spectrum" << std::endl;
-    return BuildFallbackSpectrumImage8();
+    return std::vector<TestImage>{{"generated fallback", BuildFallbackSpectrumImage8()}};
 }
 
 std::vector<uint8_t> ConvertGray8ToRaw16Low12Payload(const std::vector<uint8_t>& image8)
@@ -506,9 +667,9 @@ bool SendConfigAckPacket(SOCKET control_socket, uint16_t result_code, uint16_t f
     return SendAll(control_socket, packet.data(), packet.size());
 }
 
-bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const std::vector<uint8_t>& image8)
+bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const TestImage& image)
 {
-    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image8);
+    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image.pixels8);
     const uint32_t payload_crc32 = spectra::util::ComputeCrc32(payload.data(), payload.size());
 
     std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
@@ -538,7 +699,8 @@ bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const std::vecto
         state.busy = false;
     }
 
-    std::cout << "[spectra_bridge_test] image frame sent, payload="
+    std::cout << "[spectra_bridge_test] image frame sent, name=\""
+              << image.name << "\", payload="
               << payload.size() << " bytes, crc32=0x"
               << std::hex << std::uppercase << payload_crc32 << std::dec << std::endl;
     return true;
@@ -662,8 +824,10 @@ void ControlThreadMain(SOCKET control_socket, SharedState& state)
     }
 }
 
-void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<uint8_t>& image8)
+void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<TestImage>& image_bank)
 {
+    std::size_t next_image_index = 0u;
+
     while (true)
     {
         {
@@ -679,8 +843,12 @@ void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<
             state.trigger_pending = false;
         }
 
-        std::cout << "[spectra_bridge_test] sending configured spectrum image" << std::endl;
-        if (!SendOneImageFrame(image_socket, state, image8))
+        const TestImage& image = image_bank[next_image_index % image_bank.size()];
+        ++next_image_index;
+
+        std::cout << "[spectra_bridge_test] sending spectrum image: "
+                  << image.name << " (" << next_image_index << ")" << std::endl;
+        if (!SendOneImageFrame(image_socket, state, image))
         {
             std::cout << "[spectra_bridge_test] image client disconnected" << std::endl;
             return;
@@ -690,34 +858,44 @@ void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<
 
 int RunSelfTest(const ProgramOptions& options)
 {
-    std::string loaded_path;
-    std::vector<uint8_t> image8 = LoadConfiguredImage8(options, &loaded_path);
-    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image8);
-
-    std::string error;
-    std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
-    spectra::network::WriteUint32LE(spectra::protocol::kImageMagic, header.data() + 0);
-    spectra::network::WriteUint16LE(spectra::protocol::kImageProtocolVersion, header.data() + 4);
-    spectra::network::WriteUint16LE(
-        static_cast<uint16_t>(spectra::protocol::kImageFrameHeaderSize), header.data() + 6);
-    spectra::network::WriteUint32LE(static_cast<uint32_t>(payload.size()), header.data() + 8);
-    spectra::network::WriteUint32LE(kImageWidth, header.data() + 12);
-    spectra::network::WriteUint32LE(kImageHeight, header.data() + 16);
-    spectra::network::WriteUint32LE(spectra::protocol::kPixelFormatRaw16Low12, header.data() + 20);
-    spectra::network::WriteUint32LE(spectra::util::ComputeCrc32(payload.data(), payload.size()), header.data() + 24);
-
-    spectra::protocol::ImageFrameHeader parsed = {};
-    if (!spectra::protocol::ParseImageFrameHeader(header, &parsed, &error))
+    std::string loaded_description;
+    std::vector<TestImage> image_bank = LoadConfiguredImageBank(options, &loaded_description);
+    if (image_bank.empty())
     {
-        std::cerr << "[spectra_bridge_test] self-test failed: " << error << std::endl;
+        std::cerr << "[spectra_bridge_test] self-test failed: image bank is empty" << std::endl;
         return 1;
     }
 
+    std::string error;
+    for (const TestImage& image : image_bank)
+    {
+        std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image.pixels8);
+
+        std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
+        spectra::network::WriteUint32LE(spectra::protocol::kImageMagic, header.data() + 0);
+        spectra::network::WriteUint16LE(spectra::protocol::kImageProtocolVersion, header.data() + 4);
+        spectra::network::WriteUint16LE(
+            static_cast<uint16_t>(spectra::protocol::kImageFrameHeaderSize), header.data() + 6);
+        spectra::network::WriteUint32LE(static_cast<uint32_t>(payload.size()), header.data() + 8);
+        spectra::network::WriteUint32LE(kImageWidth, header.data() + 12);
+        spectra::network::WriteUint32LE(kImageHeight, header.data() + 16);
+        spectra::network::WriteUint32LE(spectra::protocol::kPixelFormatRaw16Low12, header.data() + 20);
+        spectra::network::WriteUint32LE(spectra::util::ComputeCrc32(payload.data(), payload.size()), header.data() + 24);
+
+        spectra::protocol::ImageFrameHeader parsed = {};
+        if (!spectra::protocol::ParseImageFrameHeader(header, &parsed, &error))
+        {
+            std::cerr << "[spectra_bridge_test] self-test failed for "
+                      << image.name << ": " << error << std::endl;
+            return 1;
+        }
+    }
+
     std::cout << "[spectra_bridge_test] self-test OK" << std::endl;
-    std::cout << "  image=" << loaded_path << std::endl;
-    std::cout << "  dimensions=" << parsed.width << "x" << parsed.height << std::endl;
-    std::cout << "  payload=" << parsed.payload_len << " bytes" << std::endl;
-    std::cout << "  crc32=0x" << std::hex << std::uppercase << parsed.crc32 << std::dec << std::endl;
+    std::cout << "  source=" << loaded_description << std::endl;
+    std::cout << "  image_count=" << image_bank.size() << std::endl;
+    std::cout << "  dimensions=" << kImageWidth << "x" << kImageHeight << std::endl;
+    std::cout << "  payload=" << kImagePayloadSize << " bytes" << std::endl;
     return 0;
 }
 
@@ -736,9 +914,15 @@ int main(int argc, char** argv)
         return RunSelfTest(options);
     }
 
-    std::string loaded_path;
-    std::vector<uint8_t> image8 = LoadConfiguredImage8(options, &loaded_path);
-    std::cout << "[spectra_bridge_test] loaded image: " << loaded_path << std::endl;
+    std::string loaded_description;
+    std::vector<TestImage> image_bank = LoadConfiguredImageBank(options, &loaded_description);
+    if (image_bank.empty())
+    {
+        std::cerr << "[spectra_bridge_test] no image available" << std::endl;
+        return 1;
+    }
+    std::cout << "[spectra_bridge_test] loaded image source: " << loaded_description
+              << ", image_count=" << image_bank.size() << std::endl;
     std::cout << "[spectra_bridge_test] image protocol: 800x600 RAW16_LOW12 + CRC32" << std::endl;
 
     WSADATA wsa_data;
@@ -797,7 +981,7 @@ int main(int argc, char** argv)
 
     SharedState state;
     std::thread control_thread(ControlThreadMain, control_socket, std::ref(state));
-    std::thread image_thread(ImageThreadMain, image_socket, std::ref(state), std::cref(image8));
+    std::thread image_thread(ImageThreadMain, image_socket, std::ref(state), std::cref(image_bank));
 
     control_thread.join();
 
