@@ -257,9 +257,15 @@ bool SendConfigAckPacket(SOCKET control_socket, uint16_t result_code, uint16_t f
     return SendAll(control_socket, packet.data(), packet.size());
 }
 
-std::vector<uint8_t> BuildImagePayload()
+std::vector<uint8_t> BuildImagePayload(uint32_t numerator, uint32_t denominator)
 {
     std::vector<uint8_t> payload(kImagePayloadSize, 0u);
+    constexpr uint32_t kLaneCount = 4u;
+    constexpr uint32_t kLaneWidth = kImageWidth / kLaneCount;
+    if (denominator == 0u)
+    {
+        denominator = 1u;
+    }
 
     // 构造一个容易识别的 12bit 图案：
     // 横向是主渐变，纵向叠加轻微变化。
@@ -268,12 +274,20 @@ std::vector<uint8_t> BuildImagePayload()
     {
         for (uint32_t x = 0u; x < kImageWidth; ++x)
         {
-            const std::size_t pixel_index = static_cast<std::size_t>(y) * kImageWidth + x;
-            const std::size_t payload_offset = pixel_index * sizeof(uint16_t);
-
             const uint16_t horizontal = static_cast<uint16_t>((x * 4095u) / (kImageWidth - 1u));
             const uint16_t vertical = static_cast<uint16_t>((y * 511u) / (kImageHeight - 1u));
-            const uint16_t pixel12 = static_cast<uint16_t>((horizontal + vertical) & 0x0FFFu);
+            const uint32_t signal = static_cast<uint32_t>(horizontal) + static_cast<uint32_t>(vertical);
+            const uint32_t scaled = (signal * numerator) / denominator;
+            const uint16_t pixel12 = static_cast<uint16_t>(scaled > 4095u ? 4095u : scaled);
+
+            // 模拟 GLUX1605BSI Figure 42 中纯有效像素的 4-lane 交织顺序。
+            // 正常 x 会被放到 payload 中的 sample*4+lane 位置：
+            // 0, laneWidth, 2*laneWidth, 3*laneWidth, 1...
+            const uint32_t lane = x / kLaneWidth;
+            const uint32_t sample = x % kLaneWidth;
+            const std::size_t payload_pixel_index =
+                static_cast<std::size_t>(y) * kImageWidth + sample * kLaneCount + lane;
+            const std::size_t payload_offset = payload_pixel_index * sizeof(uint16_t);
 
             // 每像素发送 16bit，小端，低 12 位有效。
             WriteUint16LE(pixel12, payload.data() + payload_offset);
@@ -283,9 +297,22 @@ std::vector<uint8_t> BuildImagePayload()
     return payload;
 }
 
-bool SendOneImageFrame(SOCKET image_socket, SharedState& state)
+std::vector<uint8_t> BuildSingleImagePayload()
 {
-    std::vector<uint8_t> payload = BuildImagePayload();
+    return BuildImagePayload(1u, 1u);
+}
+
+std::vector<uint8_t> BuildHdrImagePayload()
+{
+    std::vector<uint8_t> payload = BuildImagePayload(1u, 1u);
+    std::vector<uint8_t> lg_payload = BuildImagePayload(1u, 4u);
+    payload.insert(payload.end(), lg_payload.begin(), lg_payload.end());
+    return payload;
+}
+
+bool SendOneImageFrame(SOCKET image_socket, SharedState& state, bool hdr_mode)
+{
+    std::vector<uint8_t> payload = hdr_mode ? BuildHdrImagePayload() : BuildSingleImagePayload();
     const uint32_t payload_crc32 = ComputeCrc32(payload.data(), payload.size());
 
     std::array<uint8_t, 32> header = {};
@@ -448,7 +475,7 @@ void ControlThreadMain(SOCKET control_socket, SharedState& state)
     }
 }
 
-void ImageThreadMain(SOCKET image_socket, SharedState& state)
+void ImageThreadMain(SOCKET image_socket, SharedState& state, bool hdr_mode)
 {
     while (true)
     {
@@ -466,8 +493,10 @@ void ImageThreadMain(SOCKET image_socket, SharedState& state)
             state.trigger_pending = false;
         }
 
-        std::cout << "[MockFPGA] sending one image frame" << std::endl;
-        if (!SendOneImageFrame(image_socket, state))
+        std::cout << "[MockFPGA] sending one "
+                  << (hdr_mode ? "HDR HG+LG image frame" : "image frame")
+                  << std::endl;
+        if (!SendOneImageFrame(image_socket, state, hdr_mode))
         {
             std::cout << "[MockFPGA] image client disconnected" << std::endl;
             return;
@@ -477,8 +506,17 @@ void ImageThreadMain(SOCKET image_socket, SharedState& state)
 
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    bool hdr_mode = false;
+    for (int index = 1; index < argc; ++index)
+    {
+        if (std::strcmp(argv[index], "--hdr") == 0)
+        {
+            hdr_mode = true;
+        }
+    }
+
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
     {
@@ -506,8 +544,8 @@ int main()
         return 1;
     }
 
-    std::cout << "[MockFPGA] waiting for control connection on port "
-              << kDefaultControlPort << std::endl;
+    std::cout << "[MockFPGA] mode=" << (hdr_mode ? "HDR_HG_THEN_LG" : "SINGLE_PLANE")
+              << ", waiting for control connection on port " << kDefaultControlPort << std::endl;
     SOCKET control_socket = accept(control_listen_socket, NULL, NULL);
     if (control_socket == INVALID_SOCKET)
     {
@@ -536,7 +574,7 @@ int main()
     SharedState state;
 
     std::thread control_thread(ControlThreadMain, control_socket, std::ref(state));
-    std::thread image_thread(ImageThreadMain, image_socket, std::ref(state));
+    std::thread image_thread(ImageThreadMain, image_socket, std::ref(state), hdr_mode);
 
     control_thread.join();
 

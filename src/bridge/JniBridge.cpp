@@ -8,7 +8,9 @@ namespace bridge {
 namespace {
 
 const char* kOnImageFrameMethodName = "onImageFrame";
-const char* kOnImageFrameMethodSignature = "(II[S[B)V";
+const char* kOnImageFrameMethodSignature = "(II[S[B[B)V";
+const char* kOnHdrImageFrameMethodName = "onHdrImageFrame";
+const char* kOnHdrImageFrameMethodSignature = "(II[S[S[B)V";
 const char* kOnStatusMethodName = "onStatus";
 const char* kOnStatusMethodSignature = "(II)V";
 const char* kOnConfigAckMethodName = "onConfigAck";
@@ -52,6 +54,7 @@ JniBridge::JniBridge(JavaVM* java_vm)
     : java_vm_(java_vm),
       listener_global_ref_(NULL),
       on_image_frame_method_(NULL),
+      on_hdr_image_frame_method_(NULL),
       on_status_method_(NULL),
       on_config_ack_method_(NULL),
       on_transport_error_method_(NULL)
@@ -103,6 +106,8 @@ bool JniBridge::Initialize(JNIEnv* env, jobject listener, std::string* error)
 
     on_image_frame_method_ =
         env->GetMethodID(listener_class, kOnImageFrameMethodName, kOnImageFrameMethodSignature);
+    on_hdr_image_frame_method_ =
+        env->GetMethodID(listener_class, kOnHdrImageFrameMethodName, kOnHdrImageFrameMethodSignature);
     on_status_method_ =
         env->GetMethodID(listener_class, kOnStatusMethodName, kOnStatusMethodSignature);
     on_config_ack_method_ =
@@ -113,6 +118,7 @@ bool JniBridge::Initialize(JNIEnv* env, jobject listener, std::string* error)
     env->DeleteLocalRef(listener_class);
 
     if (on_image_frame_method_ == NULL ||
+        on_hdr_image_frame_method_ == NULL ||
         on_status_method_ == NULL ||
         on_config_ack_method_ == NULL ||
         on_transport_error_method_ == NULL)
@@ -240,16 +246,138 @@ void JniBridge::OnImageFrameReady(const image::ConvertedImageFrame& frame)
         return;
     }
 
+    jbyteArray fpga_payload_array = env->NewByteArray(static_cast<jsize>(frame.fpga_payload.size()));
+    if (fpga_payload_array == NULL)
+    {
+        LogAndClearJavaException(env);
+        env->DeleteLocalRef(pixels16_array);
+        env->DeleteLocalRef(pixels8_array);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    env->SetByteArrayRegion(fpga_payload_array,
+                            0,
+                            static_cast<jsize>(frame.fpga_payload.size()),
+                            reinterpret_cast<const jbyte*>(frame.fpga_payload.data()));
+    if (env->ExceptionCheck())
+    {
+        LogAndClearJavaException(env);
+        env->DeleteLocalRef(pixels16_array);
+        env->DeleteLocalRef(pixels8_array);
+        env->DeleteLocalRef(fpga_payload_array);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
     env->CallVoidMethod(listener_global_ref_,
                         on_image_frame_method_,
                         static_cast<jint>(frame.width),
                         static_cast<jint>(frame.height),
                         pixels16_array,
-                        pixels8_array);
+                        pixels8_array,
+                        fpga_payload_array);
     LogAndClearJavaException(env);
 
     env->DeleteLocalRef(pixels16_array);
     env->DeleteLocalRef(pixels8_array);
+    env->DeleteLocalRef(fpga_payload_array);
+    ReleaseThreadEnv(did_attach);
+}
+
+void JniBridge::OnHdrImageFrameReady(const image::ConvertedHdrImageFrame& frame)
+{
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+
+    JNIEnv* env = NULL;
+    bool did_attach = false;
+    std::string error;
+    if (!AcquireThreadEnv(&env, &did_attach, &error))
+    {
+        return;
+    }
+
+    if (frame.hg_pixels16.size() != frame.lg_pixels16.size())
+    {
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    const jsize pixel_count = static_cast<jsize>(frame.hg_pixels16.size());
+
+    jshortArray hg_pixels16_array = env->NewShortArray(pixel_count);
+    if (hg_pixels16_array == NULL)
+    {
+        LogAndClearJavaException(env);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    jshortArray lg_pixels16_array = env->NewShortArray(pixel_count);
+    if (lg_pixels16_array == NULL)
+    {
+        LogAndClearJavaException(env);
+        env->DeleteLocalRef(hg_pixels16_array);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    std::vector<jshort> hg_values(pixel_count, 0);
+    std::vector<jshort> lg_values(pixel_count, 0);
+    for (jsize index = 0; index < pixel_count; ++index)
+    {
+        const std::size_t pixel_index = static_cast<std::size_t>(index);
+        hg_values[index] = static_cast<jshort>(frame.hg_pixels16[pixel_index]);
+        lg_values[index] = static_cast<jshort>(frame.lg_pixels16[pixel_index]);
+    }
+
+    env->SetShortArrayRegion(hg_pixels16_array, 0, pixel_count, hg_values.data());
+    env->SetShortArrayRegion(lg_pixels16_array, 0, pixel_count, lg_values.data());
+    if (env->ExceptionCheck())
+    {
+        LogAndClearJavaException(env);
+        env->DeleteLocalRef(hg_pixels16_array);
+        env->DeleteLocalRef(lg_pixels16_array);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    jbyteArray fpga_payload_array = env->NewByteArray(static_cast<jsize>(frame.fpga_payload.size()));
+    if (fpga_payload_array == NULL)
+    {
+        LogAndClearJavaException(env);
+        env->DeleteLocalRef(hg_pixels16_array);
+        env->DeleteLocalRef(lg_pixels16_array);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    env->SetByteArrayRegion(fpga_payload_array,
+                            0,
+                            static_cast<jsize>(frame.fpga_payload.size()),
+                            reinterpret_cast<const jbyte*>(frame.fpga_payload.data()));
+    if (env->ExceptionCheck())
+    {
+        LogAndClearJavaException(env);
+        env->DeleteLocalRef(hg_pixels16_array);
+        env->DeleteLocalRef(lg_pixels16_array);
+        env->DeleteLocalRef(fpga_payload_array);
+        ReleaseThreadEnv(did_attach);
+        return;
+    }
+
+    env->CallVoidMethod(listener_global_ref_,
+                        on_hdr_image_frame_method_,
+                        static_cast<jint>(frame.width),
+                        static_cast<jint>(frame.height),
+                        hg_pixels16_array,
+                        lg_pixels16_array,
+                        fpga_payload_array);
+    LogAndClearJavaException(env);
+
+    env->DeleteLocalRef(hg_pixels16_array);
+    env->DeleteLocalRef(lg_pixels16_array);
+    env->DeleteLocalRef(fpga_payload_array);
     ReleaseThreadEnv(did_attach);
 }
 

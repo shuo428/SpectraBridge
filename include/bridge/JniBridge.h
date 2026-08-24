@@ -29,6 +29,7 @@ public:
     JniBridge& operator=(const JniBridge&) = delete;
 
     void OnImageFrameReady(const image::ConvertedImageFrame& frame) override;
+    void OnHdrImageFrameReady(const image::ConvertedHdrImageFrame& frame) override;
     void OnStatusPacket(const protocol::StatusPacket& packet) override;
     void OnConfigAckPacket(const protocol::ConfigAckPacket& packet) override;
     void OnTransportError(const std::string& channel, const std::string& message) override;
@@ -50,6 +51,7 @@ private:
     JavaVM* java_vm_;
     jobject listener_global_ref_;
     jmethodID on_image_frame_method_;
+    jmethodID on_hdr_image_frame_method_;
     jmethodID on_status_method_;
     jmethodID on_config_ack_method_;
     jmethodID on_transport_error_method_;

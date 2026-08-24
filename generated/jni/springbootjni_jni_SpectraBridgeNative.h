@@ -28,10 +28,10 @@ JNIEXPORT void JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeDestroy
 /*
  * Class:     springbootjni_jni_SpectraBridgeNative
  * Method:    nativeConnect
- * Signature: (JLjava/lang/String;IIZ)V
+ * Signature: (JLjava/lang/String;IIZIILjava/lang/String;Ljava/lang/String;)V
  */
 JNIEXPORT void JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeConnect
-  (JNIEnv *, jclass, jlong, jstring, jint, jint, jboolean);
+  (JNIEnv *, jclass, jlong, jstring, jint, jint, jboolean, jint, jint, jstring, jstring);
 
 /*
  * Class:     springbootjni_jni_SpectraBridgeNative

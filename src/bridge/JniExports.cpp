@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 
+#include "image/ImageConverter.h"
 #include "protocol/ImageProtocol.h"
 #include "springbootjni_jni_SpectraBridgeNative.h"
 
@@ -81,6 +82,36 @@ bool IsValidPort(jint port)
     return port >= 1 && port <= 65535;
 }
 
+bool IsValidDimension(jint value)
+{
+    return value > 0;
+}
+
+bool ParsePixelFormat(const std::string& pixel_format, uint32_t* parsed_pixel_format)
+{
+    if (pixel_format == "RAW16_LOW12")
+    {
+        *parsed_pixel_format = spectra::protocol::kPixelFormatRaw16Low12;
+        return true;
+    }
+    return false;
+}
+
+bool ParseReadoutOrder(const std::string& readout_order, spectra::image::ReadoutOrder* parsed_readout_order)
+{
+    if (readout_order == "GLUX1605_HDR_4LANE_INTERLEAVED_EFFECTIVE")
+    {
+        *parsed_readout_order = spectra::image::ReadoutOrder::kGlux1605Hdr4LaneInterleaved;
+        return true;
+    }
+    if (readout_order == "ROW_MAJOR")
+    {
+        *parsed_readout_order = spectra::image::ReadoutOrder::kRowMajor;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 JNIEXPORT jlong JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeCreate(
@@ -130,7 +161,11 @@ JNIEXPORT void JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeConnect(
     jstring host,
     jint control_port,
     jint image_port,
-    jboolean verify_crc)
+    jboolean verify_crc,
+    jint expected_width,
+    jint expected_height,
+    jstring pixel_format,
+    jstring readout_order)
 {
     spectra::bridge::NativeContext* context = RequireContext(env, native_handle);
     if (context == NULL)
@@ -144,9 +179,21 @@ JNIEXPORT void JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeConnect(
         return;
     }
 
+    if (pixel_format == NULL || readout_order == NULL)
+    {
+        ThrowIllegalArgument(env, "pixelFormat and readoutOrder must not be null");
+        return;
+    }
+
     if (!IsValidPort(control_port) || !IsValidPort(image_port))
     {
         ThrowIllegalArgument(env, "controlPort and imagePort must be in range 1..65535");
+        return;
+    }
+
+    if (!IsValidDimension(expected_width) || !IsValidDimension(expected_height))
+    {
+        ThrowIllegalArgument(env, "expectedWidth and expectedHeight must be greater than zero");
         return;
     }
 
@@ -158,15 +205,51 @@ JNIEXPORT void JNICALL Java_springbootjni_jni_SpectraBridgeNative_nativeConnect(
         return;
     }
 
+    const std::string pixel_format_value = JStringToUtf8(env, pixel_format, &ok);
+    if (!ok)
+    {
+        ThrowRuntimeError(env, "failed to convert pixelFormat string from Java to UTF-8");
+        return;
+    }
+
+    const std::string readout_order_value = JStringToUtf8(env, readout_order, &ok);
+    if (!ok)
+    {
+        ThrowRuntimeError(env, "failed to convert readoutOrder string from Java to UTF-8");
+        return;
+    }
+
+    uint32_t parsed_pixel_format = 0u;
+    if (!ParsePixelFormat(pixel_format_value, &parsed_pixel_format))
+    {
+        ThrowIllegalArgument(env, "unsupported pixelFormat: " + pixel_format_value);
+        return;
+    }
+
+    spectra::image::ReadoutOrder parsed_readout_order = spectra::image::ReadoutOrder::kRowMajor;
+    if (!ParseReadoutOrder(readout_order_value, &parsed_readout_order))
+    {
+        ThrowIllegalArgument(env, "unsupported readoutOrder: " + readout_order_value);
+        return;
+    }
+
+    if (parsed_readout_order == spectra::image::ReadoutOrder::kGlux1605Hdr4LaneInterleaved
+        && (expected_width % 4) != 0)
+    {
+        ThrowIllegalArgument(env, "GLUX1605 HDR 4-lane readout requires expectedWidth divisible by 4");
+        return;
+    }
+
     spectra::service::SpectraBridgeConfig config;
     config.control_endpoint.host = host_value;
     config.control_endpoint.port = static_cast<uint16_t>(control_port);
     config.image_endpoint.host = host_value;
     config.image_endpoint.port = static_cast<uint16_t>(image_port);
     config.verify_crc = (verify_crc == JNI_TRUE);
-    config.expected_width = 800u;
-    config.expected_height = 600u;
-    config.expected_pixel_format = spectra::protocol::kPixelFormatRaw16Low12;
+    config.expected_width = static_cast<uint32_t>(expected_width);
+    config.expected_height = static_cast<uint32_t>(expected_height);
+    config.expected_pixel_format = parsed_pixel_format;
+    config.readout_order = parsed_readout_order;
 
     std::string error;
     if (!context->client->Connect(config, &error))

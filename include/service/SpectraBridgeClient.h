@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "bridge/BridgeCallbacks.h"
+#include "image/ImageConverter.h"
 #include "network/TcpClient.h"
 #include "protocol/ControlProtocol.h"
 
@@ -34,6 +35,9 @@ struct SpectraBridgeConfig {
     uint32_t expected_width;
     uint32_t expected_height;
     uint32_t expected_pixel_format;
+    // 像素格式只描述每个像素的位宽和有效位；readout_order 描述 payload 的空间顺序。
+    // 当前 GLUX1605BSI HDR 模式由 FPGA 发送纯有效像素，但按 4 个 Sub-LVDS lane 交织。
+    image::ReadoutOrder readout_order;
 };
 
 // 整个 native 采集桥的核心服务类。

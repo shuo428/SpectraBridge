@@ -17,6 +17,8 @@ public:
 
     // 图像接收线程在完成“16 位容器、低 12 位有效” -> 16bit/8bit 转换后回调。
     virtual void OnImageFrameReady(const image::ConvertedImageFrame& frame) = 0;
+    // HDR 图像接收线程在完成 HG/LG 双平面拆分和空间重排后回调。
+    virtual void OnHdrImageFrameReady(const image::ConvertedHdrImageFrame& frame) = 0;
     // 控制接收线程收到状态包后回调。
     virtual void OnStatusPacket(const protocol::StatusPacket& packet) = 0;
     // 控制接收线程收到配置应答包后回调。
