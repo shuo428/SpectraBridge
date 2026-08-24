@@ -41,6 +41,7 @@ SpectraBridgeClient::SpectraBridgeClient(bridge::BridgeCallbacks* callbacks)
     config_.expected_width = 800u;
     config_.expected_height = 600u;
     config_.expected_pixel_format = protocol::kPixelFormatRaw16Low12;
+    config_.readout_order = image::ReadoutOrder::kRowMajor;
 }
 
 SpectraBridgeClient::~SpectraBridgeClient()
@@ -277,11 +278,15 @@ void SpectraBridgeClient::ImageReceiveLoop()
         // 具体图像规格。尺寸不匹配时不能把图像交给上层，否则后续显示和定量分析都会错位。
         if (header.width != config_.expected_width || header.height != config_.expected_height)
         {
+            std::ostringstream dimension_message;
+            dimension_message << "received dimensions do not match configured dimensions, actual="
+                              << header.width << "x" << header.height
+                              << ", expected=" << config_.expected_width << "x" << config_.expected_height;
             HandleWorkerFailure(
                 "image",
                 BuildIntegrityError(
                     "INVALID_DIMENSIONS",
-                    "received dimensions do not match configured dimensions"));
+                    dimension_message.str()));
             return;
         }
 
@@ -341,20 +346,60 @@ void SpectraBridgeClient::ImageReceiveLoop()
             }
         }
 
-        image::ConvertedImageFrame frame;
-        // 当前 FPGA 发送的是 16 位像素流，但只有低 12 位有效。
-        // native 侧在这里统一完成掩码和 8 位显示图转换，JNI 层只接收整理后的结果。
-        if (!image::ConvertRaw16Low12ToGray(payload, header.width, header.height, &frame, &error))
+        std::size_t single_plane_payload_size = 0u;
+        if (!protocol::TryComputeRaw16Low12PayloadSize(
+                header.width, header.height, &single_plane_payload_size))
         {
-            HandleWorkerFailure("image", error);
+            HandleWorkerFailure(
+                "image",
+                BuildIntegrityError("INVALID_DIMENSIONS", "RAW16 payload size calculation overflow"));
             return;
         }
 
-        if (callbacks_ != NULL)
+        if (payload.size() == single_plane_payload_size)
         {
-            // 这里统一回调转换后的图像数据，后续 JNI 层可以决定传 8 位还是 16 位版本给 Java。
-            callbacks_->OnImageFrameReady(frame);
+            image::ConvertedImageFrame frame;
+            // 当前 FPGA 发送的是 16 位像素流，但只有低 12 位有效。
+            // native 侧在这里统一完成掩码、GLUX1605有效像素重排和8位显示图转换。
+            if (!image::ConvertRaw16Low12ToGray(
+                    payload, header.width, header.height, config_.readout_order, &frame, &error))
+            {
+                HandleWorkerFailure("image", error);
+                return;
+            }
+
+            if (callbacks_ != NULL)
+            {
+                callbacks_->OnImageFrameReady(frame);
+            }
+            continue;
         }
+
+        if (payload.size() == single_plane_payload_size * 2u)
+        {
+            image::ConvertedHdrImageFrame frame;
+            // HDR模式约定一次触发返回两个完整平面：先HG，后LG。
+            // C++只拆分和平面内重排，不在此处做强度融合。
+            if (!image::ConvertHdrRaw16Low12ToPlanes(
+                    payload, header.width, header.height, config_.readout_order, &frame, &error))
+            {
+                HandleWorkerFailure("image", error);
+                return;
+            }
+
+            if (callbacks_ != NULL)
+            {
+                callbacks_->OnHdrImageFrameReady(frame);
+            }
+            continue;
+        }
+
+        HandleWorkerFailure(
+            "image",
+            BuildIntegrityError(
+                "PAYLOAD_LENGTH_MISMATCH",
+                "payload_len is neither single RAW16 plane nor HDR HG+LG two-plane payload"));
+        return;
     }
 }
 

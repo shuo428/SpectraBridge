@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "network/ByteUtils.h"
+#include "image/ImageConverter.h"
 #include "protocol/ControlProtocol.h"
 #include "protocol/ImageProtocol.h"
 #include "util/Crc32.h"
@@ -53,12 +54,33 @@ struct ProgramOptions {
     uint16_t control_port = kDefaultControlPort;
     uint16_t image_port = kDefaultImagePort;
     std::string image_path;
+    std::string fixture_dir;
+    std::string scene = "normal";
     bool self_test = false;
+    bool hdr_mode = false;
 };
 
 struct TestImage {
     std::string name;
     std::vector<uint8_t> pixels8;
+    std::vector<uint8_t> hg_pixels8;
+    std::vector<uint8_t> lg_pixels8;
+};
+
+enum class FixtureScene {
+    kNormal,
+    kHdr,
+    kDark,
+    kFlat,
+    kHdrDark,
+    kHdrFlat
+};
+
+struct FixtureSpec {
+    std::string name;
+    std::string image_path;
+    std::string hg_path;
+    std::string lg_path;
 };
 
 struct StatusSnapshot {
@@ -108,14 +130,97 @@ bool ParseUint16(const std::string& value, uint16_t* output)
     }
 }
 
+std::string ToLowerAscii(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool ParseFixtureScene(const std::string& scene_text, FixtureScene* scene)
+{
+    if (scene == NULL)
+    {
+        return false;
+    }
+
+    const std::string normalized = ToLowerAscii(scene_text);
+    if (normalized == "normal" || normalized == "single" || normalized == "spectrum")
+    {
+        *scene = FixtureScene::kNormal;
+        return true;
+    }
+    if (normalized == "hdr")
+    {
+        *scene = FixtureScene::kHdr;
+        return true;
+    }
+    if (normalized == "dark")
+    {
+        *scene = FixtureScene::kDark;
+        return true;
+    }
+    if (normalized == "flat")
+    {
+        *scene = FixtureScene::kFlat;
+        return true;
+    }
+    if (normalized == "hdr-dark" || normalized == "hdr_dark")
+    {
+        *scene = FixtureScene::kHdrDark;
+        return true;
+    }
+    if (normalized == "hdr-flat" || normalized == "hdr_flat")
+    {
+        *scene = FixtureScene::kHdrFlat;
+        return true;
+    }
+
+    return false;
+}
+
+bool SceneUsesHdrPayload(FixtureScene scene)
+{
+    return scene == FixtureScene::kHdr ||
+           scene == FixtureScene::kHdrDark ||
+           scene == FixtureScene::kHdrFlat;
+}
+
+const char* SceneName(FixtureScene scene)
+{
+    switch (scene)
+    {
+    case FixtureScene::kNormal:
+        return "normal";
+    case FixtureScene::kHdr:
+        return "hdr";
+    case FixtureScene::kDark:
+        return "dark";
+    case FixtureScene::kFlat:
+        return "flat";
+    case FixtureScene::kHdrDark:
+        return "hdr-dark";
+    case FixtureScene::kHdrFlat:
+        return "hdr-flat";
+    default:
+        return "normal";
+    }
+}
+
 void PrintUsage()
 {
     std::cout
         << "Usage:\n"
-        << "  spectra_bridge_test.exe [--control-port 5000] [--image-port 5001] [--image path.pgm]\n"
+        << "  spectra_bridge_test.exe [--control-port 5000] [--image-port 5001]\n"
+        << "                          [--scene normal|hdr|dark|flat|hdr-dark|hdr-flat]\n"
+        << "                          [--fixture-dir tools/mock-fpga/test-fixtures]\n"
+        << "                          [--image path.pgm] [--hdr]\n"
         << "  spectra_bridge_test.exe --self-test\n\n"
-        << "If --image is omitted, the program cycles through an in-memory PASS,\n"
-        << "WARNING and FAIL spectrum image bank, one image for each trigger.\n";
+        << "If --image is omitted, the program first loads the generated fixture bank\n"
+        << "for the selected scene. If fixtures are missing, it falls back to an\n"
+        << "in-memory synthetic image bank.\n"
+        << "--hdr is kept for compatibility; HDR scenes automatically send HG followed by LG.\n";
 }
 
 bool ParseOptions(int argc, char** argv, ProgramOptions* options)
@@ -136,6 +241,21 @@ bool ParseOptions(int argc, char** argv, ProgramOptions* options)
         if (arg == "--self-test")
         {
             options->self_test = true;
+            continue;
+        }
+        if (arg == "--hdr")
+        {
+            options->hdr_mode = true;
+            continue;
+        }
+        if (arg == "--scene" && index + 1 < argc)
+        {
+            options->scene = argv[++index];
+            continue;
+        }
+        if (arg == "--fixture-dir" && index + 1 < argc)
+        {
+            options->fixture_dir = argv[++index];
             continue;
         }
         if (arg == "--control-port" && index + 1 < argc)
@@ -167,6 +287,29 @@ bool ParseOptions(int argc, char** argv, ProgramOptions* options)
         return false;
     }
 
+    FixtureScene parsed_scene = FixtureScene::kNormal;
+    if (!ParseFixtureScene(options->scene, &parsed_scene))
+    {
+        std::cerr << "[spectra_bridge_test] invalid --scene: " << options->scene << std::endl;
+        PrintUsage();
+        return false;
+    }
+    options->scene = SceneName(parsed_scene);
+    if (SceneUsesHdrPayload(parsed_scene))
+    {
+        options->hdr_mode = true;
+    }
+    else if (options->hdr_mode && options->scene == "normal")
+    {
+        options->scene = "hdr";
+    }
+    else if (options->hdr_mode)
+    {
+        std::cerr << "[spectra_bridge_test] --hdr can only be combined with --scene normal. "
+                  << "Use --scene hdr-dark or --scene hdr-flat for HDR calibration fixtures." << std::endl;
+        return false;
+    }
+
     return true;
 }
 
@@ -184,6 +327,43 @@ std::vector<std::string> BuildImageSearchPaths(const std::string& configured_pat
         paths.push_back(configured_path);
     }
     return paths;
+}
+
+std::string JoinPath(const std::string& base, const std::string& relative)
+{
+    if (base.empty())
+    {
+        return relative;
+    }
+    const char last = base[base.size() - 1u];
+    if (last == '/' || last == '\\')
+    {
+        return base + relative;
+    }
+    return base + "/" + relative;
+}
+
+void AddUniquePath(std::vector<std::string>* paths, const std::string& path)
+{
+    if (paths == NULL || path.empty())
+    {
+        return;
+    }
+    if (std::find(paths->begin(), paths->end(), path) == paths->end())
+    {
+        paths->push_back(path);
+    }
+}
+
+std::vector<std::string> BuildFixtureSearchDirs(const std::string& configured_dir)
+{
+    std::vector<std::string> dirs;
+    AddUniquePath(&dirs, configured_dir);
+    AddUniquePath(&dirs, "tools/mock-fpga/test-fixtures");
+    AddUniquePath(&dirs, "../tools/mock-fpga/test-fixtures");
+    AddUniquePath(&dirs, "../../tools/mock-fpga/test-fixtures");
+    AddUniquePath(&dirs, "SpectraBridge/tools/mock-fpga/test-fixtures");
+    return dirs;
 }
 
 bool ReadPgmToken(std::istream& input, std::string* token)
@@ -484,15 +664,341 @@ std::vector<TestImage> BuildGeneratedQualityImageBank()
     return bank;
 }
 
+std::vector<uint8_t> ScaleImage8(const std::vector<uint8_t>& image8,
+                                 uint32_t numerator,
+                                 uint32_t denominator,
+                                 int offset = 0)
+{
+    if (denominator == 0u)
+    {
+        denominator = 1u;
+    }
+    std::vector<uint8_t> scaled(image8.size(), 0u);
+    for (std::size_t index = 0u; index < image8.size(); ++index)
+    {
+        const int value =
+            static_cast<int>((static_cast<uint32_t>(image8[index]) * numerator) / denominator) + offset;
+        scaled[index] = static_cast<uint8_t>(ClampGray8(value));
+    }
+    return scaled;
+}
+
+std::vector<uint8_t> BuildGeneratedCalibrationImage8(uint32_t seed,
+                                                     int base,
+                                                     int amplitude,
+                                                     bool flat_like)
+{
+    std::vector<uint8_t> image(kImagePixelCount, 0u);
+    for (uint32_t y = 0; y < kImageHeight; ++y)
+    {
+        for (uint32_t x = 0; x < kImageWidth; ++x)
+        {
+            int value = base;
+            if (flat_like)
+            {
+                const int dx = static_cast<int>(x) - static_cast<int>(kImageWidth / 2u);
+                const int dy = static_cast<int>(y) - static_cast<int>(kImageHeight / 2u);
+                const int radial = (dx * dx) / 19000 + (dy * dy) / 14000;
+                value += amplitude - radial;
+                value += static_cast<int>((x * 8u) / kImageWidth);
+            }
+            else
+            {
+                value += static_cast<int>((y * 3u) / kImageHeight);
+            }
+
+            const uint32_t noise = HashPixel(x, y, seed) % 5u;
+            value += static_cast<int>(noise) - 2;
+            image[static_cast<std::size_t>(y) * kImageWidth + x] =
+                static_cast<uint8_t>(ClampGray8(value));
+        }
+    }
+
+    // 固定缺陷点和一条轻微异常行用于测试校准包生成后的稳定缺陷地图。
+    const uint32_t defect_seed = seed + 0x5A17u;
+    AddMildHotPixels(&image, defect_seed, 30);
+    const uint32_t row = 120u + (seed % 180u);
+    for (uint32_t x = 0u; x < kImageWidth; ++x)
+    {
+        const std::size_t index = static_cast<std::size_t>(row) * kImageWidth + x;
+        image[index] = static_cast<uint8_t>(ClampGray8(static_cast<int>(image[index]) + (flat_like ? -24 : 18)));
+    }
+
+    return image;
+}
+
+std::vector<TestImage> BuildGeneratedHdrImageBank()
+{
+    std::vector<TestImage> bank;
+    for (const TestImage& normal : BuildGeneratedQualityImageBank())
+    {
+        TestImage hdr;
+        hdr.name = "HDR " + normal.name;
+        hdr.pixels8 = normal.pixels8;
+        hdr.hg_pixels8 = normal.pixels8;
+        hdr.lg_pixels8 = ScaleImage8(normal.pixels8, 1u, 4u, 4);
+        bank.push_back(hdr);
+    }
+
+    if (bank.size() >= 3u)
+    {
+        // HDR FAIL 需要 HG/LG 在同一块区域同时不可用，否则融合会用 LG 接管 HG 饱和区域。
+        AddSaturationBlock(&bank[2].lg_pixels8, 360u, 120u, 80u, 80u);
+    }
+    return bank;
+}
+
+std::vector<TestImage> BuildGeneratedSingleCalibrationBank(const std::string& label,
+                                                           bool flat_like)
+{
+    std::vector<TestImage> bank;
+    for (uint32_t index = 0u; index < 8u; ++index)
+    {
+        TestImage image;
+        std::ostringstream name;
+        name << label << " synthetic sample " << (index + 1u);
+        image.name = name.str();
+        image.pixels8 = BuildGeneratedCalibrationImage8(
+            700u + index * 17u + (flat_like ? 2000u : 1000u),
+            flat_like ? 132 : 7,
+            flat_like ? 42 : 0,
+            flat_like);
+        bank.push_back(image);
+    }
+    return bank;
+}
+
+std::vector<TestImage> BuildGeneratedHdrCalibrationBank(const std::string& label,
+                                                        bool flat_like)
+{
+    std::vector<TestImage> bank;
+    for (uint32_t index = 0u; index < 8u; ++index)
+    {
+        TestImage image;
+        std::ostringstream name;
+        name << label << " synthetic HG/LG sample " << (index + 1u);
+        image.name = name.str();
+        image.hg_pixels8 = BuildGeneratedCalibrationImage8(
+            3000u + index * 19u + (flat_like ? 1000u : 0u),
+            flat_like ? 145 : 8,
+            flat_like ? 48 : 0,
+            flat_like);
+        image.lg_pixels8 = BuildGeneratedCalibrationImage8(
+            4000u + index * 23u + (flat_like ? 1000u : 0u),
+            flat_like ? 48 : 3,
+            flat_like ? 18 : 0,
+            flat_like);
+        image.pixels8 = image.hg_pixels8;
+        bank.push_back(image);
+    }
+    return bank;
+}
+
+std::vector<TestImage> BuildGeneratedImageBankForScene(FixtureScene scene)
+{
+    if (scene == FixtureScene::kHdr)
+    {
+        return BuildGeneratedHdrImageBank();
+    }
+    if (scene == FixtureScene::kDark)
+    {
+        return BuildGeneratedSingleCalibrationBank("DARK", false);
+    }
+    if (scene == FixtureScene::kFlat)
+    {
+        return BuildGeneratedSingleCalibrationBank("FLAT", true);
+    }
+    if (scene == FixtureScene::kHdrDark)
+    {
+        return BuildGeneratedHdrCalibrationBank("HDR_DARK", false);
+    }
+    if (scene == FixtureScene::kHdrFlat)
+    {
+        return BuildGeneratedHdrCalibrationBank("HDR_FLAT", true);
+    }
+    return BuildGeneratedQualityImageBank();
+}
+
+std::vector<FixtureSpec> BuildFixtureSpecs(FixtureScene scene)
+{
+    std::vector<FixtureSpec> specs;
+    if (scene == FixtureScene::kNormal)
+    {
+        specs.push_back({"NORMAL PASS", "normal/normal_pass.pgm", "", ""});
+        specs.push_back({"NORMAL WARNING", "normal/normal_warning_hot_pixels.pgm", "", ""});
+        specs.push_back({"NORMAL FAIL", "normal/normal_fail_saturation.pgm", "", ""});
+        return specs;
+    }
+    if (scene == FixtureScene::kHdr)
+    {
+        specs.push_back({"HDR PASS", "", "hdr/hdr_pass_hg.pgm", "hdr/hdr_pass_lg.pgm"});
+        specs.push_back({"HDR WARNING", "", "hdr/hdr_warning_hg.pgm", "hdr/hdr_warning_lg.pgm"});
+        specs.push_back({"HDR FAIL", "", "hdr/hdr_fail_hg.pgm", "hdr/hdr_fail_lg.pgm"});
+        return specs;
+    }
+
+    const bool hdr = SceneUsesHdrPayload(scene);
+    const std::string folder =
+        scene == FixtureScene::kDark ? "dark" :
+        scene == FixtureScene::kFlat ? "flat" :
+        scene == FixtureScene::kHdrDark ? "hdr_dark" : "hdr_flat";
+    const std::string prefix =
+        scene == FixtureScene::kDark ? "dark" :
+        scene == FixtureScene::kFlat ? "flat" :
+        scene == FixtureScene::kHdrDark ? "hdr_dark" : "hdr_flat";
+    const std::string label =
+        scene == FixtureScene::kDark ? "DARK" :
+        scene == FixtureScene::kFlat ? "FLAT" :
+        scene == FixtureScene::kHdrDark ? "HDR_DARK" : "HDR_FLAT";
+
+    for (int index = 1; index <= 8; ++index)
+    {
+        std::ostringstream two_digits;
+        if (index < 10)
+        {
+            two_digits << "0";
+        }
+        two_digits << index;
+        const std::string frame = two_digits.str();
+        std::ostringstream name;
+        name << label << " sample " << frame;
+        if (hdr)
+        {
+            specs.push_back({
+                name.str(),
+                "",
+                folder + "/" + prefix + "_" + frame + "_hg.pgm",
+                folder + "/" + prefix + "_" + frame + "_lg.pgm",
+            });
+        }
+        else
+        {
+            specs.push_back({
+                name.str(),
+                folder + "/" + prefix + "_" + frame + ".pgm",
+                "",
+                "",
+            });
+        }
+    }
+    return specs;
+}
+
+bool LoadFixtureBankFromDir(const std::string& dir,
+                            FixtureScene scene,
+                            std::vector<TestImage>* bank,
+                            std::string* error)
+{
+    if (bank == NULL)
+    {
+        return false;
+    }
+
+    bank->clear();
+    const std::vector<FixtureSpec> specs = BuildFixtureSpecs(scene);
+    for (const FixtureSpec& spec : specs)
+    {
+        TestImage image;
+        image.name = spec.name;
+        if (SceneUsesHdrPayload(scene))
+        {
+            const std::string hg_path = JoinPath(dir, spec.hg_path);
+            const std::string lg_path = JoinPath(dir, spec.lg_path);
+            if (!FileExists(hg_path) || !FileExists(lg_path))
+            {
+                if (error != NULL)
+                {
+                    *error = "missing HDR fixture pair: " + hg_path + " / " + lg_path;
+                }
+                bank->clear();
+                return false;
+            }
+            std::string load_error;
+            if (!LoadPgm8(hg_path, &image.hg_pixels8, &load_error) ||
+                !LoadPgm8(lg_path, &image.lg_pixels8, &load_error))
+            {
+                if (error != NULL)
+                {
+                    *error = load_error;
+                }
+                bank->clear();
+                return false;
+            }
+            image.pixels8 = image.hg_pixels8;
+        }
+        else
+        {
+            const std::string path = JoinPath(dir, spec.image_path);
+            if (!FileExists(path))
+            {
+                if (error != NULL)
+                {
+                    *error = "missing fixture: " + path;
+                }
+                bank->clear();
+                return false;
+            }
+            std::string load_error;
+            if (!LoadPgm8(path, &image.pixels8, &load_error))
+            {
+                if (error != NULL)
+                {
+                    *error = load_error;
+                }
+                bank->clear();
+                return false;
+            }
+        }
+        bank->push_back(image);
+    }
+
+    return !bank->empty();
+}
+
+std::vector<TestImage> LoadFixtureImageBank(const ProgramOptions& options,
+                                            FixtureScene scene,
+                                            std::string* loaded_description)
+{
+    const std::vector<std::string> dirs = BuildFixtureSearchDirs(options.fixture_dir);
+    for (const std::string& dir : dirs)
+    {
+        std::vector<TestImage> bank;
+        std::string error;
+        if (LoadFixtureBankFromDir(dir, scene, &bank, &error))
+        {
+            if (loaded_description != NULL)
+            {
+                std::ostringstream description;
+                description << dir << " (scene=" << SceneName(scene) << ")";
+                *loaded_description = description.str();
+            }
+            return bank;
+        }
+    }
+
+    return {};
+}
+
 std::vector<TestImage> LoadConfiguredImageBank(const ProgramOptions& options, std::string* loaded_description)
 {
+    FixtureScene scene = FixtureScene::kNormal;
+    ParseFixtureScene(options.scene, &scene);
+
     if (options.image_path.empty())
     {
+        std::vector<TestImage> fixture_bank = LoadFixtureImageBank(options, scene, loaded_description);
+        if (!fixture_bank.empty())
+        {
+            return fixture_bank;
+        }
+
         if (loaded_description != NULL)
         {
-            *loaded_description = "(generated PASS/WARNING/FAIL cyclic test image bank)";
+            std::ostringstream description;
+            description << "(generated in-memory scene=" << SceneName(scene) << " fallback)";
+            *loaded_description = description.str();
         }
-        return BuildGeneratedQualityImageBank();
+        return BuildGeneratedImageBankForScene(scene);
     }
 
     std::vector<std::string> paths = BuildImageSearchPaths(options.image_path);
@@ -511,7 +1017,15 @@ std::vector<TestImage> LoadConfiguredImageBank(const ProgramOptions& options, st
             {
                 *loaded_description = path;
             }
-            return std::vector<TestImage>{{path, image8}};
+            TestImage image;
+            image.name = path;
+            image.pixels8 = image8;
+            if (options.hdr_mode)
+            {
+                image.hg_pixels8 = image8;
+                image.lg_pixels8 = ScaleImage8(image8, 1u, 4u, 4);
+            }
+            return std::vector<TestImage>{image};
         }
 
         std::cerr << "[spectra_bridge_test] failed to load "
@@ -520,24 +1034,78 @@ std::vector<TestImage> LoadConfiguredImageBank(const ProgramOptions& options, st
 
     if (loaded_description != NULL)
     {
-        *loaded_description = "(generated fallback)";
+        std::ostringstream description;
+        description << "(generated in-memory scene=" << SceneName(scene) << " fallback)";
+        *loaded_description = description.str();
     }
-    std::cout << "[spectra_bridge_test] PGM image not found, using generated fallback spectrum" << std::endl;
-    return std::vector<TestImage>{{"generated fallback", BuildFallbackSpectrumImage8()}};
+    std::cout << "[spectra_bridge_test] PGM image not found, using generated fixture fallback" << std::endl;
+    return BuildGeneratedImageBankForScene(scene);
 }
 
-std::vector<uint8_t> ConvertGray8ToRaw16Low12Payload(const std::vector<uint8_t>& image8)
+std::vector<uint8_t> ConvertGray8ToRaw16Low12Payload(const std::vector<uint8_t>& image8,
+                                                     uint32_t numerator = 1u,
+                                                     uint32_t denominator = 1u)
 {
     std::vector<uint8_t> payload(kImagePayloadSize, 0u);
-    for (std::size_t pixel_index = 0; pixel_index < image8.size(); ++pixel_index)
+    constexpr uint32_t kLaneCount = 4u;
+    const uint32_t lane_width = kImageWidth / kLaneCount;
+    if (denominator == 0u)
     {
-        // 8-bit 测试图只是人眼预览用灰度；模拟 FPGA 发送时扩展成 RAW12 DN。
-        // 高 4 位必须为 0，否则 native 的 INVALID_HIGH_BITS 检查会正确拦截。
-        const uint16_t pixel12 =
-            static_cast<uint16_t>((static_cast<uint32_t>(image8[pixel_index]) * 4095u) / 255u);
-        spectra::network::WriteUint16LE(pixel12, payload.data() + pixel_index * sizeof(uint16_t));
+        denominator = 1u;
+    }
+    for (uint32_t y = 0; y < kImageHeight; ++y)
+    {
+        for (uint32_t sample = 0; sample < lane_width; ++sample)
+        {
+            for (uint32_t lane = 0; lane < kLaneCount; ++lane)
+            {
+                // 模拟 Figure 42 中纯有效像素的 4-lane 交织顺序：
+                // 0, laneWidth, 2*laneWidth, 3*laneWidth, 1, laneWidth+1...
+                const uint32_t x = lane * lane_width + sample;
+                const std::size_t row_major_index = static_cast<std::size_t>(y) * kImageWidth + x;
+                const std::size_t payload_pixel_index =
+                    static_cast<std::size_t>(y) * kImageWidth + sample * kLaneCount + lane;
+
+                // 8-bit 测试图只是人眼预览用灰度；模拟 FPGA 发送时扩展成 RAW12 DN。
+                // 高 4 位必须为 0，否则 native 的 INVALID_HIGH_BITS 检查会正确拦截。
+                const uint32_t raw12 =
+                    (static_cast<uint32_t>(image8[row_major_index]) * 4095u) / 255u;
+                const uint32_t scaled = (raw12 * numerator) / denominator;
+                const uint16_t pixel12 =
+                    static_cast<uint16_t>(scaled > 4095u ? 4095u : scaled);
+                spectra::network::WriteUint16LE(
+                    pixel12, payload.data() + payload_pixel_index * sizeof(uint16_t));
+            }
+        }
     }
     return payload;
+}
+
+std::vector<uint8_t> ConvertGray8ToHdrRaw16Low12Payload(const std::vector<uint8_t>& image8)
+{
+    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image8);
+    std::vector<uint8_t> lg_payload = ConvertGray8ToRaw16Low12Payload(image8, 1u, 4u);
+    payload.insert(payload.end(), lg_payload.begin(), lg_payload.end());
+    return payload;
+}
+
+std::vector<uint8_t> ConvertGray8PairToHdrRaw16Low12Payload(const std::vector<uint8_t>& hg_image8,
+                                                            const std::vector<uint8_t>& lg_image8)
+{
+    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(hg_image8);
+    std::vector<uint8_t> lg_payload = ConvertGray8ToRaw16Low12Payload(lg_image8);
+    payload.insert(payload.end(), lg_payload.begin(), lg_payload.end());
+    return payload;
+}
+
+std::vector<uint8_t> BuildHdrPayloadForImage(const TestImage& image)
+{
+    const std::vector<uint8_t>& hg = image.hg_pixels8.empty() ? image.pixels8 : image.hg_pixels8;
+    if (image.lg_pixels8.empty())
+    {
+        return ConvertGray8ToHdrRaw16Low12Payload(hg);
+    }
+    return ConvertGray8PairToHdrRaw16Low12Payload(hg, image.lg_pixels8);
 }
 
 bool SendAll(SOCKET socket_handle, const uint8_t* data, std::size_t size)
@@ -667,9 +1235,11 @@ bool SendConfigAckPacket(SOCKET control_socket, uint16_t result_code, uint16_t f
     return SendAll(control_socket, packet.data(), packet.size());
 }
 
-bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const TestImage& image)
+bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const TestImage& image, bool hdr_mode)
 {
-    std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image.pixels8);
+    std::vector<uint8_t> payload = hdr_mode
+        ? BuildHdrPayloadForImage(image)
+        : ConvertGray8ToRaw16Low12Payload(image.pixels8);
     const uint32_t payload_crc32 = spectra::util::ComputeCrc32(payload.data(), payload.size());
 
     std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
@@ -699,7 +1269,9 @@ bool SendOneImageFrame(SOCKET image_socket, SharedState& state, const TestImage&
         state.busy = false;
     }
 
-    std::cout << "[spectra_bridge_test] image frame sent, name=\""
+    std::cout << "[spectra_bridge_test] "
+              << (hdr_mode ? "HDR HG+LG image frame" : "image frame")
+              << " sent, name=\""
               << image.name << "\", payload="
               << payload.size() << " bytes, crc32=0x"
               << std::hex << std::uppercase << payload_crc32 << std::dec << std::endl;
@@ -824,7 +1396,10 @@ void ControlThreadMain(SOCKET control_socket, SharedState& state)
     }
 }
 
-void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<TestImage>& image_bank)
+void ImageThreadMain(SOCKET image_socket,
+                     SharedState& state,
+                     const std::vector<TestImage>& image_bank,
+                     bool hdr_mode)
 {
     std::size_t next_image_index = 0u;
 
@@ -846,14 +1421,50 @@ void ImageThreadMain(SOCKET image_socket, SharedState& state, const std::vector<
         const TestImage& image = image_bank[next_image_index % image_bank.size()];
         ++next_image_index;
 
-        std::cout << "[spectra_bridge_test] sending spectrum image: "
+        std::cout << "[spectra_bridge_test] sending "
+                  << (hdr_mode ? "HDR HG+LG spectrum image: " : "spectrum image: ")
                   << image.name << " (" << next_image_index << ")" << std::endl;
-        if (!SendOneImageFrame(image_socket, state, image))
+        if (!SendOneImageFrame(image_socket, state, image, hdr_mode))
         {
             std::cout << "[spectra_bridge_test] image client disconnected" << std::endl;
             return;
         }
     }
+}
+
+uint16_t ExpectedRaw12FromGray8(uint8_t value)
+{
+    return static_cast<uint16_t>((static_cast<uint32_t>(value) * 4095u) / 255u);
+}
+
+bool VerifyConvertedPlane(const std::vector<uint16_t>& actual_pixels16,
+                          const std::vector<uint8_t>& expected_pixels8,
+                          const std::string& image_name,
+                          const std::string& plane_name)
+{
+    if (actual_pixels16.size() != expected_pixels8.size())
+    {
+        std::cerr << "[spectra_bridge_test] self-test size mismatch for "
+                  << image_name << " " << plane_name
+                  << ", expected_pixels=" << expected_pixels8.size()
+                  << ", actual_pixels=" << actual_pixels16.size() << std::endl;
+        return false;
+    }
+
+    for (std::size_t pixel_index = 0u; pixel_index < expected_pixels8.size(); ++pixel_index)
+    {
+        const uint16_t expected12 = ExpectedRaw12FromGray8(expected_pixels8[pixel_index]);
+        if (actual_pixels16[pixel_index] != expected12)
+        {
+            std::cerr << "[spectra_bridge_test] GLUX reorder self-test mismatch for "
+                      << image_name << " " << plane_name
+                      << " at pixel_index=" << pixel_index
+                      << ", expected=" << expected12
+                      << ", actual=" << actual_pixels16[pixel_index] << std::endl;
+            return false;
+        }
+    }
+    return true;
 }
 
 int RunSelfTest(const ProgramOptions& options)
@@ -867,9 +1478,12 @@ int RunSelfTest(const ProgramOptions& options)
     }
 
     std::string error;
+    const bool hdr_payload_mode = options.hdr_mode;
     for (const TestImage& image : image_bank)
     {
-        std::vector<uint8_t> payload = ConvertGray8ToRaw16Low12Payload(image.pixels8);
+        std::vector<uint8_t> payload = hdr_payload_mode
+            ? BuildHdrPayloadForImage(image)
+            : ConvertGray8ToRaw16Low12Payload(image.pixels8);
 
         std::array<uint8_t, spectra::protocol::kImageFrameHeaderSize> header = {};
         spectra::network::WriteUint32LE(spectra::protocol::kImageMagic, header.data() + 0);
@@ -889,13 +1503,64 @@ int RunSelfTest(const ProgramOptions& options)
                       << image.name << ": " << error << std::endl;
             return 1;
         }
+
+        if (hdr_payload_mode)
+        {
+            spectra::image::ConvertedHdrImageFrame converted = {};
+            if (!spectra::image::ConvertHdrRaw16Low12ToPlanes(
+                    payload,
+                    kImageWidth,
+                    kImageHeight,
+                    spectra::image::ReadoutOrder::kGlux1605Hdr4LaneInterleaved,
+                    &converted,
+                    &error))
+            {
+                std::cerr << "[spectra_bridge_test] HDR GLUX reorder self-test failed for "
+                          << image.name << ": " << error << std::endl;
+                return 1;
+            }
+
+            const std::vector<uint8_t>& expected_hg =
+                image.hg_pixels8.empty() ? image.pixels8 : image.hg_pixels8;
+            const std::vector<uint8_t>& expected_lg =
+                image.lg_pixels8.empty() ? ScaleImage8(expected_hg, 1u, 4u) : image.lg_pixels8;
+            if (!VerifyConvertedPlane(converted.hg_pixels16, expected_hg, image.name, "HG") ||
+                !VerifyConvertedPlane(converted.lg_pixels16, expected_lg, image.name, "LG"))
+            {
+                return 1;
+            }
+        }
+        else
+        {
+            spectra::image::ConvertedImageFrame converted = {};
+            if (!spectra::image::ConvertRaw16Low12ToGray(
+                    payload,
+                    kImageWidth,
+                    kImageHeight,
+                    spectra::image::ReadoutOrder::kGlux1605Hdr4LaneInterleaved,
+                    &converted,
+                    &error))
+            {
+                std::cerr << "[spectra_bridge_test] GLUX reorder self-test failed for "
+                          << image.name << ": " << error << std::endl;
+                return 1;
+            }
+
+            if (!VerifyConvertedPlane(converted.pixels16, image.pixels8, image.name, "single"))
+            {
+                return 1;
+            }
+        }
     }
 
     std::cout << "[spectra_bridge_test] self-test OK" << std::endl;
     std::cout << "  source=" << loaded_description << std::endl;
     std::cout << "  image_count=" << image_bank.size() << std::endl;
+    std::cout << "  scene=" << options.scene << std::endl;
+    std::cout << "  payload_mode=" << (hdr_payload_mode ? "HDR_HG_THEN_LG" : "SINGLE_PLANE") << std::endl;
     std::cout << "  dimensions=" << kImageWidth << "x" << kImageHeight << std::endl;
-    std::cout << "  payload=" << kImagePayloadSize << " bytes" << std::endl;
+    std::cout << "  payload=" << (hdr_payload_mode ? kImagePayloadSize * 2u : kImagePayloadSize)
+              << " bytes" << std::endl;
     return 0;
 }
 
@@ -923,7 +1588,12 @@ int main(int argc, char** argv)
     }
     std::cout << "[spectra_bridge_test] loaded image source: " << loaded_description
               << ", image_count=" << image_bank.size() << std::endl;
-    std::cout << "[spectra_bridge_test] image protocol: 800x600 RAW16_LOW12 + CRC32" << std::endl;
+    std::cout << "[spectra_bridge_test] image protocol: 800x600 RAW16_LOW12 + CRC32, "
+              << "payload order=GLUX1605 HDR 4-lane interleaved effective pixels" << std::endl;
+    std::cout << "[spectra_bridge_test] fixture scene: " << options.scene << std::endl;
+    std::cout << "[spectra_bridge_test] capture payload mode: "
+              << (options.hdr_mode ? "HDR HG full frame followed by LG full frame" : "single plane")
+              << std::endl;
 
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0)
@@ -981,7 +1651,12 @@ int main(int argc, char** argv)
 
     SharedState state;
     std::thread control_thread(ControlThreadMain, control_socket, std::ref(state));
-    std::thread image_thread(ImageThreadMain, image_socket, std::ref(state), std::cref(image_bank));
+    std::thread image_thread(
+        ImageThreadMain,
+        image_socket,
+        std::ref(state),
+        std::cref(image_bank),
+        options.hdr_mode);
 
     control_thread.join();
 

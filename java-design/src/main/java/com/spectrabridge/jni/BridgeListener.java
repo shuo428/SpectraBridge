@@ -19,8 +19,21 @@ public interface BridgeListener {
      *                 当前协议下每个元素只有低 12 位是有效像素值，范围 0~4095。
      * @param pixels8 8 位灰度数组，长度应为 width * height。
      *                这是 native 侧把低 12 位有效值缩放到 0~255 后得到的显示图。
+     * @param fpgaPayload FPGA 图像通道直接收到的原始有效像素 payload。
+     *                    它保持芯片/FPGA读出顺序，不做 GLUX1605BSI HDR 4-lane 转序。
      */
-    void onImageFrame(int width, int height, short[] pixels16, byte[] pixels8);
+    void onImageFrame(int width, int height, short[] pixels16, byte[] pixels8, byte[] fpgaPayload);
+
+    /**
+     * 收到 HDR 双增益图像后的回调。
+     *
+     * @param width 图像宽度
+     * @param height 图像高度
+     * @param hgPixels16 高增益平面，已经重排为正常行列顺序
+     * @param lgPixels16 低增益平面，已经重排为正常行列顺序
+     * @param fpgaPayload FPGA 原始双平面 payload，顺序为 HG + LG
+     */
+    void onHdrImageFrame(int width, int height, short[] hgPixels16, short[] lgPixels16, byte[] fpgaPayload);
 
     /**
      * 收到状态包后的回调。

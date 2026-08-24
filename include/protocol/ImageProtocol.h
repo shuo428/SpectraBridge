@@ -144,9 +144,17 @@ inline bool ParseImageFrameHeader(const std::array<uint8_t, kImageFrameHeaderSiz
         return false;
     }
 
-    if (expected_payload_size != static_cast<std::size_t>(header->payload_len))
+    const std::size_t payload_len = static_cast<std::size_t>(header->payload_len);
+    const bool single_plane_payload = payload_len == expected_payload_size;
+    const bool hdr_two_plane_payload =
+        expected_payload_size <= std::numeric_limits<std::size_t>::max() / 2u &&
+        payload_len == expected_payload_size * 2u;
+    if (!single_plane_payload && !hdr_two_plane_payload)
     {
-        SetImageProtocolError(error, "PAYLOAD_LENGTH_MISMATCH", "payload_len does not equal width * height * 2");
+        SetImageProtocolError(
+            error,
+            "PAYLOAD_LENGTH_MISMATCH",
+            "payload_len must equal one RAW16 plane or two RAW16 planes(HG followed by LG)");
         return false;
     }
 
