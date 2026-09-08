@@ -48,6 +48,36 @@ void CloseNativeSocket(std::uintptr_t handle)
 #endif
 }
 
+int ReadLastSocketErrorCode()
+{
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+std::string FormatSocketErrorCode(int error_code)
+{
+#ifdef _WIN32
+    return "WSA error=" + std::to_string(error_code);
+#else
+    return "errno=" + std::to_string(error_code);
+#endif
+}
+
+std::string BuildSocketErrorMessage(const std::string& prefix, int error_code)
+{
+    return prefix + ", " + FormatSocketErrorCode(error_code);
+}
+
+std::string FormatEndpoint(const std::string& host, uint16_t port)
+{
+    std::ostringstream stream;
+    stream << host << ":" << port;
+    return stream.str();
+}
+
 }  // namespace
 
 TcpClient::TcpClient() : socket_handle_(InvalidSocketValue())
@@ -85,15 +115,18 @@ bool TcpClient::Connect(const std::string& host, uint16_t port, std::string* err
         if (error != NULL)
         {
 #ifdef _WIN32
-            *error = "getaddrinfo failed with code " + std::to_string(getaddrinfo_result);
+            *error = "getaddrinfo failed for " + FormatEndpoint(host, port) +
+                     ", WSA error=" + std::to_string(getaddrinfo_result);
 #else
-            *error = gai_strerror(getaddrinfo_result);
+            *error = "getaddrinfo failed for " + FormatEndpoint(host, port) +
+                     ", message=" + gai_strerror(getaddrinfo_result);
 #endif
         }
         return false;
     }
 
     bool connected = false;
+    std::string last_error_message;
     for (struct addrinfo* current = result; current != NULL; current = current->ai_next)
     {
         // 逐个尝试解析结果，兼容 IPv4 / IPv6。
@@ -102,6 +135,9 @@ bool TcpClient::Connect(const std::string& host, uint16_t port, std::string* err
 
         if (native_socket == InvalidSocketValue())
         {
+            const int socket_error_code = ReadLastSocketErrorCode();
+            last_error_message = BuildSocketErrorMessage(
+                "failed to create socket for " + FormatEndpoint(host, port), socket_error_code);
             continue;
         }
 
@@ -121,6 +157,12 @@ bool TcpClient::Connect(const std::string& host, uint16_t port, std::string* err
             break;
         }
 
+        // 必须在 closesocket/close 之前立即读取错误码。
+        // 否则关闭 socket 或后续 API 调用可能覆盖线程局部错误码，
+        // 最终把真实的 10061/10060 等错误误报成 WSA error=0。
+        const int connect_error_code = ReadLastSocketErrorCode();
+        last_error_message = BuildSocketErrorMessage(
+            "failed to connect to " + FormatEndpoint(host, port), connect_error_code);
         CloseNativeSocket(native_socket);
     }
 
@@ -128,7 +170,15 @@ bool TcpClient::Connect(const std::string& host, uint16_t port, std::string* err
 
     if (!connected && error != NULL)
     {
-        *error = BuildLastSocketErrorMessage("failed to connect");
+        if (!last_error_message.empty())
+        {
+            *error = last_error_message;
+        }
+        else
+        {
+            *error = "failed to connect to " + FormatEndpoint(host, port) +
+                     ": no usable address was returned by getaddrinfo";
+        }
     }
 
     return connected;
@@ -219,7 +269,14 @@ bool TcpClient::RecvAll(uint8_t* data, std::size_t size, std::string* error)
         {
             if (error != NULL)
             {
-                *error = BuildLastSocketErrorMessage("failed to receive data");
+                if (bytes_received == 0)
+                {
+                    *error = "failed to receive data: connection closed by peer";
+                }
+                else
+                {
+                    *error = BuildLastSocketErrorMessage("failed to receive data");
+                }
             }
             return false;
         }
@@ -267,11 +324,7 @@ bool TcpClient::EnsureSocketRuntime(std::string* error)
 std::string TcpClient::BuildLastSocketErrorMessage(const std::string& prefix)
 {
     // 错误信息保持简洁，只提供定位所需的系统错误码。
-#ifdef _WIN32
-    return prefix + ", WSA error=" + std::to_string(WSAGetLastError());
-#else
-    return prefix + ", errno=" + std::to_string(errno);
-#endif
+    return BuildSocketErrorMessage(prefix, ReadLastSocketErrorCode());
 }
 
 }  // namespace network

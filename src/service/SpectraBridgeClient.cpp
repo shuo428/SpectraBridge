@@ -31,6 +31,20 @@ std::string ToHex32(uint32_t value)
     return stream.str();
 }
 
+std::string BuildChannelConnectError(const char* channel_name,
+                                     const TcpEndpoint& endpoint,
+                                     const std::string& detail)
+{
+    std::ostringstream stream;
+    stream << channel_name << " TCP connect failed, host=" << endpoint.host
+           << ", port=" << endpoint.port;
+    if (!detail.empty())
+    {
+        stream << ", detail=(" << detail << ")";
+    }
+    return stream.str();
+}
+
 }  // namespace
 
 SpectraBridgeClient::SpectraBridgeClient(bridge::BridgeCallbacks* callbacks)
@@ -66,14 +80,24 @@ bool SpectraBridgeClient::Connect(const SpectraBridgeConfig& config, std::string
     config_ = config;
 
     // 先连控制通道，再连图像通道；任一失败都立即回滚已建立的连接。
-    if (!control_client_.Connect(config.control_endpoint.host, config.control_endpoint.port, error))
+    std::string connect_error;
+    if (!control_client_.Connect(config.control_endpoint.host, config.control_endpoint.port, &connect_error))
     {
+        if (error != NULL)
+        {
+            *error = BuildChannelConnectError("control", config.control_endpoint, connect_error);
+        }
         return false;
     }
 
-    if (!image_client_.Connect(config.image_endpoint.host, config.image_endpoint.port, error))
+    connect_error.clear();
+    if (!image_client_.Connect(config.image_endpoint.host, config.image_endpoint.port, &connect_error))
     {
         control_client_.Close();
+        if (error != NULL)
+        {
+            *error = BuildChannelConnectError("image", config.image_endpoint, connect_error);
+        }
         return false;
     }
 
